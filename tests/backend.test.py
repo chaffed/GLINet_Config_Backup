@@ -262,6 +262,93 @@ cp /etc/crontabs/root /out/cron_removed.txt
     check(read(out, "cron_removed", "txt").splitlines() == ["0 1 * * * /bin/someone-elses-job"],
           "cron-remove (package removal): our line is gone, the other job stays")
 
+    # ---------------------------------------------------------- encryption
+    drive = os.path.join(work, "enc")
+    os.makedirs(drive)
+    with open(os.path.join(work, "pass.txt"), "w") as f:
+        f.write(PASSPHRASE + "\n")
+    shutil.copy(os.path.join(work, "pass.txt"), os.path.join(drive, "..pass"))
+    out = run(r"""
+pass=$(cat /tmp/mountd/disk1_part1/..pass); rm /tmp/mountd/disk1_part1/..pass
+# Every command line on the router while this runs, to look for the passphrase.
+( while :; do for c in /proc/[0-9]*/cmdline; do tr '\0' ' ' < "$c" 2>/dev/null; echo; done; done >> /out/cmdlines.txt ) &
+watch=$!
+step=short; f=$(autobackup passphrase-input); printf '%s\n' 'short' > "$f"; o autobackup set-passphrase "$f"
+step=outside; echo "$pass" > /tmp/elsewhere; o autobackup set-passphrase /tmp/elsewhere; rm -f /tmp/elsewhere
+step=input; o autobackup passphrase-input
+f=$(cat /out/input.json); ls -l "$f" | cut -c1-10 > /out/input_mode.txt
+printf '%s\n' "$pass" > "$f"
+step=setpass; o autobackup set-passphrase "$f"
+[ -e "$f" ] && echo left > /out/input_left.txt
+ls -l /etc/config/autobackup_auth | cut -c1-10 > /out/auth_mode.txt
+step=config; o autobackup config
+step=b1; o autobackup backup
+kill $watch 2>/dev/null; wait $watch 2>/dev/null
+uci -q get autobackup_auth.main.passphrase > /out/stored.txt
+a=$(jsonfilter -i /out/b1.json -e @.file)
+uci -q get autobackup_auth.main.passphrase > /tmp/p
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$a" -out /tmp/plain.tar.gz -pass file:/tmp/p 2>/out/dec.err
+tar tzf /tmp/plain.tar.gz > /out/plain_list.txt 2>&1
+tar xzf /tmp/plain.tar.gz -O etc/config/autobackup_auth > /out/auth_in_backup.txt 2>&1
+rm -f /tmp/p /tmp/plain.tar.gz
+step=status; o autobackup status
+# Missing passphrase (settings edited by hand): fail, never a plain backup.
+printf "\nconfig auth 'main'\n" > /etc/config/autobackup_auth
+step=nopass; o autobackup backup
+ls /tmp/mountd/disk1_part1/autobackup/GL-BE9300/ > /out/files_nopass.txt
+# Encryption off forgets the passphrase; the next backup has none in it.
+f=$(autobackup passphrase-input); printf '%s\n' "$pass" > "$f"; autobackup set-passphrase "$f" >/dev/null
+step=off; o autobackup set encrypt=0
+step=config_off; o autobackup config
+step=b2; o autobackup backup
+tar xzf "$(jsonfilter -i /out/b2.json -e @.file)" -O etc/config/autobackup_auth > /out/auth_in_plain.txt 2>&1
+logread > /out/log.txt 2>/dev/null || true
+cat /var/log/messages >> /out/log.txt 2>/dev/null || true
+grep -rlF -- "$pass" /tmp /var/run /etc/autobackup /out/*.json /out/*.err 2>/dev/null | grep -v '^/tmp/mountd' > /out/leaks.txt
+true
+""", drive, "enc")
+    check(read(out, "short").get("reason") == "invalid_passphrase", "passphrase: shorter than 8 characters is refused")
+    check(read(out, "outside").get("reason") == "no_input", "passphrase: only files made by passphrase-input are read")
+    check(read(out, "input_mode", "txt") == "-rw-------", "passphrase-input: the file is root only")
+    check(read(out, "setpass").get("ok") is True and read(out, "input_left", "txt") is None,
+          "set-passphrase: stored, and the input file is deleted")
+    check(read(out, "stored", "txt") == PASSPHRASE, "set-passphrase: quoting characters survive (stored exactly)")
+    check(read(out, "auth_mode", "txt") == "-rw-------", "set-passphrase: the passphrase file stays root only")
+    cfgj = read(out, "config")
+    check(cfgj.get("encrypt") == "1" and cfgj.get("passphrase_set") is True and PASSPHRASE not in json.dumps(cfgj),
+          "set-passphrase: encryption is on; config says a passphrase is set, never what it is")
+    b1 = read(out, "b1")
+    hd = host_dir(drive)
+    rec = {}
+    if b1.get("ok"):
+        with open(os.path.join(hd, b1["id"].split("/")[1] + ".json")) as f:
+            rec = json.load(f)
+    arch = os.path.join(hd, rec.get("file", "?"))
+    check(rec.get("encrypted") is True and rec.get("file", "").endswith(".tar.gz.enc"), "encrypted backup: .tar.gz.enc, record says encrypted")
+    check(os.path.isfile(arch) and open(arch, "rb").read(8) == b"Salted__" and rec.get("sha256") == sha256(arch),
+          "encrypted backup: an openssl file; the record's sha256 is of the encrypted file")
+    check("etc/config/system" in read(out, "plain_list", "txt") and read(out, "dec", "err") == "",
+          "encrypted backup: decrypts with the passphrase to the router's settings")
+    uci_form = "option passphrase '" + PASSPHRASE.replace("'", "'\\''") + "'"
+    check(uci_form in read(out, "auth_in_backup", "txt"), "encrypted backup: holds the passphrase (inside the encryption only)")
+    check(read(out, "status").get("encrypt") is True and read(out, "status").get("passphrase_set") is True, "status: encryption on")
+    check(read(out, "nopass").get("reason") == "no_passphrase" and not any(n.endswith(".tar.gz") for n in read(out, "files_nopass", "txt").split()),
+          "no passphrase: the backup fails, never falls back to an unencrypted file")
+    check(read(out, "off").get("ok") is True and read(out, "config_off").get("passphrase_set") is False
+          and read(out, "config_off").get("encrypt") == "0", "encryption off: the passphrase is forgotten")
+    check(read(out, "b2").get("ok") is True and PASSPHRASE not in read(out, "auth_in_plain", "txt")
+          and "config auth" in read(out, "auth_in_plain", "txt"), "unencrypted backup: holds no passphrase")
+    cmdlines = read(out, "cmdlines", "txt")
+    check("openssl" in cmdlines and PASSPHRASE not in cmdlines, "passphrase: never in a command line (openssl was seen running)")
+    check(PASSPHRASE not in (read(out, "log", "txt") or ""), "passphrase: never in the log")
+    check(read(out, "leaks", "txt") == "", "passphrase: in no file in /tmp, /var/run, /etc/autobackup or the output (%s)" % read(out, "leaks", "txt"))
+    leaked_drive = []
+    for dp, _, fs in os.walk(drive):
+        for n in fs:
+            if not n.endswith(".enc") and PASSPHRASE.encode() in open(os.path.join(dp, n), "rb").read():
+                leaked_drive.append(n)
+    check(leaked_drive == [], "passphrase: on the drive only inside encrypted files (%s)" % leaked_drive)
+
     # ------------------------------------------------- delete, busy, names
     drive = os.path.join(work, "delete")
     os.makedirs(drive)

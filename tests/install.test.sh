@@ -41,12 +41,11 @@ check "! grep -q autobackup /etc/crontabs/root 2>/dev/null" "clean install: no s
 mkdir -p /etc/crontabs
 echo "0 1 * * * /bin/someone-elses-job" >> /etc/crontabs/root
 autobackup set keep=7 hour=4 schedule=daily >/dev/null
-uci set autobackup_auth.main.passphrase="it'"'"'s a secret"
-uci commit autobackup_auth
+printf "%s\n" "it'"'"'s a secret" | autobackup set-passphrase - >/dev/null
 kept() {
 	[ "$(uci -q get autobackup.main.keep)" = 7 ] && [ "$(uci -q get autobackup.main.hour)" = 4 ] &&
 	grep -q "^30 4 \* \* \* /usr/bin/autobackup backup --scheduled" /etc/crontabs/root &&
-	[ "$(uci -q get autobackup_auth.main.passphrase)" = "it'"'"'s a secret" ] &&
+	[ "$(uci -q get autobackup_auth.main.passphrase)" = "it'"'"'s a secret" ] && [ "$(uci -q get autobackup.main.encrypt)" = 1 ] &&
 	[ "$(mode /etc/config/autobackup_auth)" = -rw------- ]
 }
 

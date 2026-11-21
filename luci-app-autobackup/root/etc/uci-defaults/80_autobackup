@@ -9,6 +9,12 @@ chmod 600 /etc/config/autobackup_auth
 rm -f /etc/config/autobackup-opkg /etc/config/autobackup_auth-opkg
 mkdir -p /etc/autobackup
 chmod 700 /etc/autobackup
+# A passphrase is kept only while encryption is on (an unencrypted backup
+# must not carry it); settings edited by hand are brought back in line.
+if [ "$(uci -q get autobackup.main.encrypt)" != 1 ] && [ -n "$(uci -q get autobackup_auth.main.passphrase)" ]; then
+	printf "\nconfig auth 'main'\n" > /etc/config/autobackup_auth
+	chmod 600 /etc/config/autobackup_auth
+fi
 
 # The rpcd plugin and the menu entry: visible without a reboot.
 rm -f /tmp/luci-indexcache* 2>/dev/null
