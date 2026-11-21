@@ -65,7 +65,10 @@ def run(script, drive=None, name="run"):
             "-v", out + ":/out"]
     if drive:
         args += ["-v", drive + ":" + DRIVE]
-    subprocess.run(args + [IMAGE, "sh", "-c", SETUP + script], check=True)
+    # The backend writes root-only files (umask 077); on Linux the test
+    # (not root) could not read them back.
+    tail = "\nchmod -R a+rwX /out %s 2>/dev/null; true\n" % (DRIVE if drive else "")
+    subprocess.run(args + [IMAGE, "sh", "-c", SETUP + script + tail], check=True)
     return out
 
 
