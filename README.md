@@ -71,20 +71,33 @@ to your network, or turn on encryption.
 
 ### From the package source (recommended)
 
-Add chaffed's package source once. It also carries
-[ISPy](https://github.com/chaffed/luci-app-ispy) and
-[Modem Health](https://github.com/chaffed/luci-app-modemhealth). Log in to
-the router over SSH and run:
+Auto Backup is in [chaffed's package source](https://chaffed.github.io/openwrt-packages/),
+together with [ISPy](https://github.com/chaffed/luci-app-ispy) and
+[Modem Health](https://github.com/chaffed/luci-app-modemhealth). One line
+adds the source and installs the app. It asks for the router's address and
+logs in to the router over SSH (you type the router's admin password).
+
+On a **Mac or Linux** computer, in Terminal:
 
 ```sh
-wget -O /tmp/chaffed.pub https://chaffed.github.io/openwrt-packages/chaffed.pub
-opkg-key add /tmp/chaffed.pub
-echo 'src/gz chaffed https://chaffed.github.io/openwrt-packages' >> /etc/opkg/customfeeds.conf
-opkg update
-opkg install luci-app-autobackup
+curl -fsSL https://chaffed.github.io/openwrt-packages/install.sh | sh
+```
+
+On **Windows**, in PowerShell:
+
+```powershell
+irm https://chaffed.github.io/openwrt-packages/install.ps1 | iex
+```
+
+Or **on the router** itself, over SSH:
+
+```sh
+curl -fsSL https://chaffed.github.io/openwrt-packages/setup.sh | sh -s -- luci-app-autobackup
 ```
 
 Later versions arrive like any other package: `opkg update && opkg upgrade luci-app-autobackup`.
+[What the setup changes](https://chaffed.github.io/openwrt-packages/#add): the package source's
+signing key and one line in `/etc/opkg/customfeeds.conf`.
 
 ### From a release
 
