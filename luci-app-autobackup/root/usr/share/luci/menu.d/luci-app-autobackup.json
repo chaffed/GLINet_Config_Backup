@@ -1,0 +1,39 @@
+{
+	"admin/system/autobackup": {
+		"title": "Auto Backup",
+		"order": 75,
+		"action": {
+			"type": "alias",
+			"path": "admin/system/autobackup/status"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-autobackup"
+			]
+		}
+	},
+	"admin/system/autobackup/status": {
+		"title": "Status",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "autobackup/status"
+		}
+	},
+	"admin/system/autobackup/backups": {
+		"title": "Backups",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "autobackup/backups"
+		}
+	},
+	"admin/system/autobackup/settings": {
+		"title": "Settings",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "autobackup/settings"
+		}
+	}
+}

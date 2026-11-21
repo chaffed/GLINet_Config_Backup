@@ -1,0 +1,33 @@
+{
+	"luci-app-autobackup": {
+		"description": "Grant access to Auto Backup",
+		"read": {
+			"ubus": {
+				"luci.autobackup": [
+					"status",
+					"list",
+					"check",
+					"config"
+				]
+			},
+			"file": {
+				"/tmp/mountd/*/autobackup/*/*": [ "read" ],
+				"/mnt/*/autobackup/*/*": [ "read" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.autobackup": [
+					"backup",
+					"delete",
+					"restore",
+					"set",
+					"set_passphrase"
+				]
+			},
+			"file": {
+				"/tmp/autobackup-upload": [ "write" ]
+			}
+		}
+	}
+}

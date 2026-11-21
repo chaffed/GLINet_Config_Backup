@@ -1,0 +1,88 @@
+#!/bin/sh
+# rpcd plugin exposing Auto Backup to LuCI as ubus object "luci.autobackup".
+# Every value is checked by the backend (/usr/bin/autobackup). A passphrase
+# goes in (set_passphrase, restore) but never comes out, and never becomes
+# a command's argument: it is written into a root-only file the backend
+# made for it (printf is built into the shell, so not even printf's
+# arguments show up as a process).
+# shellcheck shell=dash disable=SC1091,SC2154
+
+. /usr/share/libubox/jshn.sh
+
+AB=/usr/bin/autobackup
+
+# Hand a passphrase to the backend: prints the name of a root-only file
+# holding it, or nothing when there is none.
+pass_file() {
+	local f
+	[ -n "$1" ] || return 0
+	f=$($AB passphrase-input) || return 1
+	printf '%s\n' "$1" > "$f"
+	echo "$f"
+}
+
+case "$1" in
+	list)
+		echo '{"status":{},"list":{},"backup":{},"delete":{"id":"str"},"check":{"src":"str"},"restore":{"src":"str","passphrase":"str","force_firmware":true,"force_unverified":true},"config":{},"set":{"values":{}},"set_passphrase":{"passphrase":"str"}}'
+		;;
+	call)
+		case "$2" in
+			status|list|config)
+				$AB "$2"
+				;;
+			backup)
+				$AB backup
+				;;
+			delete)
+				read -r input
+				json_load "$input"
+				json_get_var id id
+				$AB delete "$id"
+				;;
+			check)
+				read -r input
+				json_load "$input"
+				json_get_var src src
+				$AB restore-check "$src"
+				;;
+			restore)
+				read -r input
+				json_load "$input"
+				json_get_var src src
+				json_get_var passphrase passphrase
+				json_get_var ff force_firmware
+				json_get_var fu force_unverified
+				set -- restore "$src" --yes
+				[ "$ff" = 1 ] && set -- "$@" --force-firmware
+				[ "$fu" = 1 ] && set -- "$@" --force-unverified
+				if [ -n "$passphrase" ]; then
+					f=$(pass_file "$passphrase") || { echo '{"ok":false,"reason":"no_input"}'; exit 0; }
+					set -- "$@" --passphrase-file "$f"
+				fi
+				$AB "$@"
+				;;
+			set)
+				read -r input
+				json_load "$input"
+				set -- set
+				if json_is_a values object; then
+					json_select values
+					json_get_keys keys
+					for k in $keys; do
+						json_get_var v "$k"
+						set -- "$@" "$k=$v"
+					done
+				fi
+				$AB "$@"
+				;;
+			set_passphrase)
+				read -r input
+				json_load "$input"
+				json_get_var passphrase passphrase
+				f=$(pass_file "$passphrase") || { echo '{"ok":false,"reason":"no_input"}'; exit 0; }
+				[ -n "$f" ] || { echo '{"ok":false,"reason":"invalid_passphrase","field":"passphrase"}'; exit 0; }
+				$AB set-passphrase "$f"
+				;;
+		esac
+		;;
+esac

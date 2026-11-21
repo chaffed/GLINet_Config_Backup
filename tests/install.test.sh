@@ -36,6 +36,7 @@ check "[ \"\$(uci -q get autobackup.main.schedule)\" = off ] && [ \"\$(uci -q ge
 check "[ ! -e /etc/uci-defaults/80_autobackup ] && [ -d /etc/autobackup ]" "clean install: the first-run script ran"
 check "[ -x /etc/init.d/autobackup ] && ls /etc/rc.d/ | grep -q autobackup" "clean install: the schedule is applied at every start"
 check "! grep -q autobackup /etc/crontabs/root 2>/dev/null" "clean install: no schedule until one is chosen"
+check "[ -s /usr/share/luci/menu.d/luci-app-autobackup.json ] && [ -s /usr/share/rpcd/acl.d/luci-app-autobackup.json ] && [ -x /usr/libexec/rpcd/luci.autobackup ] && [ -s /www/luci-static/resources/autobackup/app.js ]" "clean install: LuCI menu entry, permissions, its router-side program and pages are in place"
 
 # what the owner then does
 mkdir -p /etc/crontabs
@@ -57,7 +58,7 @@ check "! ls /etc/config/ | grep -q -- -opkg" "upgrade: no stray copies of the se
 
 # ------------------------------------------------------ remove, install again
 opkg remove luci-app-autobackup >/tmp/remove.log 2>&1 || cat /tmp/remove.log
-check "[ ! -e /usr/bin/autobackup ] && [ ! -e /etc/init.d/autobackup ] && ! ls /etc/rc.d/ | grep -q autobackup" "remove: the program and its start script are gone"
+check "[ ! -e /usr/bin/autobackup ] && [ ! -e /etc/init.d/autobackup ] && ! ls /etc/rc.d/ | grep -q autobackup && [ ! -e /www/luci-static/resources/autobackup/app.js ]" "remove: the program, its start script and the pages are gone"
 check "! grep -q autobackup /etc/crontabs/root && grep -q someone-elses-job /etc/crontabs/root" "remove: the schedule is taken out of cron, other jobs stay"
 check "[ -s /etc/config/autobackup ] && [ -s /etc/config/autobackup_auth ]" "remove: settings and passphrase stay on the router"
 opkg install "$this" >/tmp/again.log 2>&1 || cat /tmp/again.log

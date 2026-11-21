@@ -19,14 +19,39 @@ jobs:
         run: |
           shellcheck luci-app-autobackup/root/usr/bin/autobackup \
             luci-app-autobackup/root/etc/init.d/autobackup \
+            luci-app-autobackup/root/usr/libexec/rpcd/luci.autobackup \
             luci-app-autobackup/root/etc/uci-defaults/* \
             scripts/*.sh tests/*.sh
 
       - name: Check Python syntax
         run: python3 -m py_compile tests/*.py
 
+      - name: Check JavaScript syntax
+        run: |
+          for f in $(find luci-app-autobackup/htdocs -name '*.js'); do
+            node -e "new Function('module', require('fs').readFileSync('$f', 'utf8'))"
+          done
+
+      - name: Check JSON files
+        run: |
+          for f in $(find luci-app-autobackup -name '*.json'); do python3 -m json.tool "$f" > /dev/null; done
+
       - name: Test the backend (OpenWrt 23.05 container, a folder as the USB drive)
         run: python3 tests/backend.test.py
+
+      - name: Test the pages in LuCI with a browser (OpenWrt 23.05 container)
+        run: |
+          npm install --no-save playwright-core
+          node tests/luci.test.js
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: |
+            .test-out/luci/*.png
+            .test-out/gl/*.png
+          if-no-files-found: ignore
 
       - name: Build ipk
         run: scripts/build-ipk.sh dist
