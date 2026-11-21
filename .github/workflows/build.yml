@@ -21,6 +21,12 @@ jobs:
             luci-app-autobackup/root/etc/uci-defaults/* \
             scripts/*.sh tests/*.sh
 
+      - name: Check Python syntax
+        run: python3 -m py_compile tests/*.py
+
+      - name: Test the backend (OpenWrt 23.05 container, a folder as the USB drive)
+        run: python3 tests/backend.test.py
+
       - name: Build ipk
         run: scripts/build-ipk.sh dist
 

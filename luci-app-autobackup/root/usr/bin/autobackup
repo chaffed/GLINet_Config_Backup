@@ -1,8 +1,438 @@
 #!/bin/sh
-# Auto Backup (luci-app-autobackup): placeholder, replaced in #3.
+# Auto Backup (luci-app-autobackup): the router's configuration, saved to a
+# USB drive on a schedule, and restored by hand.
+#
+#   autobackup backup [--scheduled]  save a backup now (prints JSON)
+#   autobackup list                  backups on the drive (JSON)
+#   autobackup delete ID             remove one backup (ID = folder/name)
+#   autobackup status                drive, last result, schedule (JSON)
+#   autobackup version
+#
+# Where things are:
+#   <drive>/autobackup/<hostname>/<model>_<firmware>_<YYYYMMDD-HHMMSS>.tar.gz
+#   (.tar.gz.enc when encrypted), with a record of it next to it (.json):
+#   the router it came from, its firmware, size, sha256 and the packages
+#   installed on top of the firmware (a backup holds settings, not packages).
+#   /etc/autobackup/last   the last run's result (kept across firmware upgrades)
+#
+# A drive is a mounted file system under /tmp/mountd/ (GL.iNet) or /mnt/
+# (OpenWrt's block-mount). An unplugged drive's mount point is a folder in
+# the router's own memory or flash, so nothing is ever written to a path
+# that is not a mount point: a run without a drive is stored as failed,
+# with its reason, and writes nothing.
+#
+# Every command that changes something takes the lock, so a scheduled run
+# and "Back up now" never run at once (the second one answers "busy").
+#
 # SPDX-License-Identifier: MIT
+# shellcheck shell=dash
+
 VERSION=0.1.0
-case "$1" in
+
+STATE_DIR=/etc/autobackup
+LAST="$STATE_DIR/last"
+LOCK=/var/lock/autobackup.lock
+TMP_DIR=/tmp/autobackup
+MOUNTS=/proc/mounts
+# Only this model and firmware have been tested so far; the pages say so.
+TESTED="be9300:4.10.1"
+
+umask 077
+
+# ---------------------------------------------------------------- helpers --
+
+log() { logger -t autobackup "$*" 2>/dev/null; }
+
+# A JSON string. Control characters are dropped (none of our values has a
+# reason to contain one).
+jstr() {
+	printf '"%s"' "$(printf '%s' "$1" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+# A JSON array of strings, one per line of input.
+jlist() {
+	local first=1 line
+	printf '['
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		[ $first = 1 ] || printf ','
+		first=0
+		jstr "$line"
+	done
+	printf ']'
+}
+
+jbool() { if [ "$1" = 1 ]; then printf true; else printf false; fi; }
+
+# Whole number, else the default.
+num() {
+	case "$1" in
+		''|*[!0-9]*) echo "$2" ;;
+		*) echo "$1" ;;
+	esac
+}
+
+# A file or folder name made of safe characters only.
+safe_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-64; }
+
+cfg() { uci -q get "autobackup.main.$1"; }
+
+hostname_() {
+	local h
+	h=$(uci -q get system.@system[0].hostname)
+	safe_name "${h:-OpenWrt}"
+}
+
+# Short model name: GL.iNet's own (be9300), else the board name.
+model() {
+	local m=""
+	[ -r /proc/gl-hw-info/model ] && m=$(tr -d '\n' < /proc/gl-hw-info/model)
+	[ -n "$m" ] || m=$(board)
+	safe_name "${m:-unknown}"
+}
+
+board() { [ -r /tmp/sysinfo/board_name ] && tr -d '\n' < /tmp/sysinfo/board_name; }
+model_name() { [ -r /tmp/sysinfo/model ] && tr -d '\n' < /tmp/sysinfo/model; }
+
+openwrt_release() {
+	# shellcheck disable=SC1091
+	( . /etc/openwrt_release 2>/dev/null; printf '%s' "${DISTRIB_RELEASE:-}" )
+}
+
+# GL.iNet's firmware version (4.10.1), else OpenWrt's release.
+firmware() {
+	local v=""
+	[ -r /etc/glversion ] && v=$(tr -d '\n' < /etc/glversion)
+	[ -n "$v" ] || v=$(openwrt_release)
+	printf '%s' "${v:-unknown}"
+}
+
+is_tested() {
+	[ "$(model):$(firmware)" = "$TESTED" ] && echo 1 || echo 0
+}
+
+# Packages installed on top of the firmware: in opkg's list but not in the
+# firmware's own (/rom). Without /rom (not a squashfs image) they cannot
+# be told apart, and the record says so (packages_known false).
+user_packages() {
+	[ -r /rom/usr/lib/opkg/status ] || return 1
+	awk '
+		FNR == 1 { file++ }
+		/^Package:/ { p = $2 }
+		/^Status:/ && / installed/ { if (file == 1) rom[p] = 1; else if (!(p in rom)) print p }
+	' /rom/usr/lib/opkg/status /usr/lib/opkg/status | sort -u
+}
+
+file_size() { wc -c < "$1" | tr -d ' '; }
+sha256() { sha256sum "$1" | cut -d' ' -f1; }
+
+# ---------------------------------------------------------------- drives --
+
+# Mounted drives, one mount point per line. Mount points with spaces or
+# other escaped characters are left out (GL.iNet and block-mount never make
+# them).
+drives() {
+	awk '$2 ~ /^\/(tmp\/mountd|mnt)\/[A-Za-z0-9._-]+$/ &&
+		$3 !~ /^(tmpfs|ramfs|overlay|squashfs|proc|sysfs|devtmpfs|devpts|cgroup2?)$/ { print $2 }' "$MOUNTS" 2>/dev/null | sort -u
+}
+
+is_mounted() {
+	drives | grep -qxF "$1"
+}
+
+# The drive to use: the one in the settings, else the first one found.
+# Sets DRIVE to its mount point, or fails with the reason in DRIVE_REASON.
+# Call it directly, not in $(...), or both are lost.
+resolve_drive() {
+	local want
+	want=$(cfg drive)
+	DRIVE=""
+	DRIVE_REASON=""
+	if [ -n "$want" ]; then
+		if is_mounted "$want"; then
+			DRIVE=$want
+			return 0
+		fi
+		DRIVE_REASON=drive_missing
+		return 1
+	fi
+	DRIVE=$(drives | head -n 1)
+	[ -n "$DRIVE" ] && return 0
+	DRIVE_REASON=no_drive
+	return 1
+}
+
+# -P: one line per file system, however long its name.
+free_kb() { df -kP "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
+
+# ------------------------------------------------------------ work files --
+
+# Set WORK to a root-only scratch name in RAM ($TMP_DIR/<what>.<pid>);
+# everything starting with it is removed when this process ends. Call it
+# directly, not in $(...), or the clean-up is set in a subshell.
+WORK=""
+work_file() {
+	mkdir -p "$TMP_DIR"
+	chmod 700 "$TMP_DIR"
+	WORK="$TMP_DIR/$1.$$"
+	rm -f "$WORK" "$WORK".*
+	trap 'cleanup' EXIT
+	trap 'exit 1' INT TERM
+}
+
+cleanup() {
+	[ -n "$WORK" ] && rm -f "$WORK" "$WORK".*
+}
+
+# --------------------------------------------------------------- the lock --
+
+# Take the lock for the rest of this process, or fail at once.
+lock() {
+	mkdir -p "${LOCK%/*}"
+	exec 9>"$LOCK"
+	flock -n 9
+}
+
+is_busy() {
+	mkdir -p "${LOCK%/*}"
+	( exec 9>"$LOCK"; flock -n 9 ) 2>/dev/null && echo 0 || echo 1
+}
+
+# ------------------------------------------------------------ last result --
+
+# record_result ok|failed REASON FILE
+record_result() {
+	local now last_ok
+	now=$(date +%s)
+	last_ok=$(state_get last_ok)
+	[ "$1" = ok ] && last_ok=$now
+	mkdir -p "$STATE_DIR"
+	chmod 700 "$STATE_DIR"
+	{
+		echo "result=$1"
+		echo "reason=$2"
+		echo "time=$now"
+		echo "file=$3"
+		echo "last_ok=${last_ok:-0}"
+	} > "$LAST.tmp" && mv "$LAST.tmp" "$LAST"
+}
+
+state_get() {
+	[ -r "$LAST" ] && sed -n "s/^$1=//p" "$LAST" | head -n 1
+}
+
+fail() {
+	# fail REASON [DETAIL]: store and print a failed run.
+	record_result failed "$1" ""
+	log "backup failed: $1${2:+ ($2)}"
+	printf '{"ok":false,"reason":%s,"detail":%s}\n' "$(jstr "$1")" "$(jstr "${2:-}")"
+	exit 1
+}
+
+# ----------------------------------------------------------------- backup --
+
+cmd_backup() {
+	local drive dir host name stamp tmp out size sum archive ext detail n scheduled=0
+	[ "$1" = --scheduled ] && scheduled=1
+	if ! lock; then
+		printf '{"ok":false,"reason":"busy","detail":""}\n'
+		exit 1
+	fi
+	resolve_drive || fail "$DRIVE_REASON"
+	drive=$DRIVE
+
+	work_file backup
+	tmp=$WORK
+
+	detail=$(sysupgrade -b "$tmp.tar.gz" 2>&1)
+	if [ ! -s "$tmp.tar.gz" ] || ! gzip -t "$tmp.tar.gz" 2>/dev/null; then
+		fail backup_failed "$(printf '%s' "$detail" | tail -n 1)"
+	fi
+	out="$tmp.tar.gz"
+	ext=tar.gz
+
+	size=$(file_size "$out")
+	sum=$(sha256 "$out")
+
+	host=$(hostname_)
+	stamp=$(date +%Y%m%d-%H%M%S)
+	name="$(model)_$(safe_name "$(firmware)")_$stamp"
+	archive="$name.$ext"
+
+	# The drive may have gone while the backup was made.
+	is_mounted "$drive" || fail drive_missing
+	dir="$drive/autobackup/$host"
+	mkdir -p "$dir" 2>/dev/null || fail write_failed "cannot make $dir"
+	# Two backups within a second ("Back up now" twice): number the second.
+	n=1
+	while [ -e "$dir/$name.json" ] || [ -e "$dir/$archive" ]; do
+		n=$((n + 1))
+		name="$(model)_$(safe_name "$(firmware)")_$stamp-$n"
+		archive="$name.$ext"
+	done
+
+	if ! cp "$out" "$dir/$archive.part" 2>/dev/null || [ "$(sha256 "$dir/$archive.part")" != "$sum" ]; then
+		rm -f "$dir/$archive.part"
+		fail write_failed "the copy on the drive is incomplete (drive full?)"
+	fi
+	mv "$dir/$archive.part" "$dir/$archive" || fail write_failed "cannot rename on the drive"
+
+	write_record "$dir/$name.json" "$archive" "$size" "$sum" 0 || {
+		rm -f "$dir/$archive" "$dir/$name.json"
+		fail write_failed "cannot write the record (drive full?)"
+	}
+	sync
+
+	prune "$dir"
+	record_result ok "" "$host/$name"
+	if [ $scheduled = 1 ]; then
+		log "scheduled backup saved: $dir/$archive"
+	else
+		log "backup saved: $dir/$archive"
+	fi
+	printf '{"ok":true,"id":%s,"file":%s,"size":%s}\n' "$(jstr "$host/$name")" "$(jstr "$dir/$archive")" "$size"
+}
+
+# write_record PATH ARCHIVE SIZE SHA256 ENCRYPTED
+write_record() {
+	local pk known=1
+	pk=$(user_packages) || known=0
+	{
+		printf '{"format":1,"app_version":%s,"file":%s,"time":%s' "$(jstr "$VERSION")" "$(jstr "$2")" "$(date +%s)"
+		printf ',"hostname":%s,"model":%s,"model_name":%s,"board":%s' \
+			"$(jstr "$(hostname_)")" "$(jstr "$(model)")" "$(jstr "$(model_name)")" "$(jstr "$(board)")"
+		printf ',"firmware":%s,"openwrt":%s' "$(jstr "$(firmware)")" "$(jstr "$(openwrt_release)")"
+		printf ',"size":%s,"sha256":%s,"encrypted":%s' "$3" "$(jstr "$4")" "$(jbool "$5")"
+		printf ',"packages_known":%s,"packages":%s}\n' "$(jbool $known)" "$(printf '%s\n' "$pk" | jlist)"
+	} > "$1.part" && [ -s "$1.part" ] && mv "$1.part" "$1"
+}
+
+# Records in a folder, newest first: "time<TAB>path" lines.
+records_by_time() {
+	local r t
+	for r in "$1"/*.json; do
+		[ -f "$r" ] || continue
+		t=$(jsonfilter -i "$r" -e '@.time' 2>/dev/null)
+		case "$t" in ''|*[!0-9]*) continue ;; esac
+		printf '%s\t%s\n' "$t" "$r"
+	done | sort -rn
+}
+
+# The archive a record describes (only names in its own folder).
+archive_of() {
+	local f
+	f=$(jsonfilter -i "$1" -e '@.file' 2>/dev/null)
+	case "$f" in
+		*/*|.*|'') return 1 ;;
+	esac
+	echo "${1%/*}/$f"
+}
+
+# Keep the newest `keep` backups in a folder; remove the rest.
+prune() {
+	local keep n=0 t r a
+	keep=$(num "$(cfg keep)" 10)
+	[ "$keep" -ge 1 ] || keep=1
+	records_by_time "$1" | while IFS="$(printf '\t')" read -r t r; do
+		n=$((n + 1))
+		[ $n -le "$keep" ] && continue
+		a=$(archive_of "$r") && rm -f "$a"
+		rm -f "$r"
+		log "removed old backup ${r##*/} (keeping $keep)"
+	done
+}
+
+# ------------------------------------------------------------ list/delete --
+
+cmd_list() {
+	local drive first=1 d t r r2 a missing
+	printf '{'
+	if resolve_drive; then
+		drive=$DRIVE
+		printf '"drive":%s,"backups":[' "$(jstr "$drive")"
+		for d in "$drive"/autobackup/*/; do
+			[ -d "$d" ] || continue
+			records_by_time "${d%/}"
+		done | sort -rn | while IFS="$(printf '\t')" read -r t r; do
+			missing=false
+			a=$(archive_of "$r") || continue
+			[ -f "$a" ] || missing=true
+			[ $first = 1 ] || printf ','
+			first=0
+			r2=${r%.json}
+			# The record, with its id (folder/name) and whether its archive is there.
+			printf '%s' "$(sed "1s/^{/{\"id\":$(jstr "$(basename "${r%/*}")/${r2##*/}" | sed 's/[\/&]/\\&/g'),\"missing\":$missing,/" "$r")"
+		done
+		printf ']'
+	else
+		printf '"drive":"","reason":%s,"backups":[]' "$(jstr "$DRIVE_REASON")"
+	fi
+	printf '}\n'
+}
+
+# Check an ID (folder/name, safe characters only) and print the record's path.
+record_path() {
+	printf '%s' "$1" | grep -qE '^[A-Za-z0-9_-][A-Za-z0-9._-]*/[A-Za-z0-9_-][A-Za-z0-9._-]*$' || return 1
+	case "$1" in *..*) return 1 ;; esac
+	resolve_drive || return 1
+	[ -f "$DRIVE/autobackup/$1.json" ] || return 1
+	echo "$DRIVE/autobackup/$1.json"
+}
+
+cmd_delete() {
+	local r a
+	if ! lock; then
+		printf '{"ok":false,"reason":"busy"}\n'
+		exit 1
+	fi
+	r=$(record_path "$1") || { printf '{"ok":false,"reason":"not_found"}\n'; exit 1; }
+	a=$(archive_of "$r") && rm -f "$a"
+	rm -f "$r"
+	sync
+	log "deleted backup $1"
+	printf '{"ok":true}\n'
+}
+
+# ----------------------------------------------------------------- status --
+
+cmd_status() {
+	local free="" last_time
+	printf '{"version":%s' "$(jstr "$VERSION")"
+	if resolve_drive; then
+		free=$(free_kb "$DRIVE")
+		printf ',"drive":%s,"drive_reason":""' "$(jstr "$DRIVE")"
+	else
+		printf ',"drive":"","drive_reason":%s' "$(jstr "$DRIVE_REASON")"
+	fi
+	printf ',"free_kb":%s' "$(num "$free" null)"
+	printf ',"drives":%s' "$(drives | jlist)"
+	last_time=$(num "$(state_get time)" 0)
+	if [ "$last_time" -gt 0 ]; then
+		printf ',"last":{"result":%s,"reason":%s,"time":%s,"id":%s}' \
+			"$(jstr "$(state_get result)")" "$(jstr "$(state_get reason)")" "$last_time" "$(jstr "$(state_get file)")"
+	else
+		printf ',"last":null'
+	fi
+	printf ',"last_ok":%s' "$(num "$(state_get last_ok)" 0)"
+	printf ',"busy":%s' "$(jbool "$(is_busy)")"
+	printf ',"router":{"hostname":%s,"model":%s,"model_name":%s,"board":%s,"firmware":%s}' \
+		"$(jstr "$(hostname_)")" "$(jstr "$(model)")" "$(jstr "$(model_name)")" "$(jstr "$(board)")" "$(jstr "$(firmware)")"
+	printf ',"tested":%s,"tested_on":%s' "$(jbool "$(is_tested)")" "$(jstr "$TESTED")"
+	printf '}\n'
+}
+
+# ------------------------------------------------------------------- main --
+
+cmd="$1"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+	backup) cmd_backup "$@" ;;
+	list) cmd_list ;;
+	delete) cmd_delete "$1" ;;
+	status) cmd_status ;;
 	version) echo "$VERSION" ;;
-	*) echo "usage: autobackup version" >&2; exit 2 ;;
+	*)
+		echo "usage: autobackup backup|list|delete ID|status|version" >&2
+		exit 2
+		;;
 esac
