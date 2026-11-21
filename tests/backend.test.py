@@ -182,6 +182,15 @@ logread > /out/log.txt 2>/dev/null || true
         json.dump({"format": 1, "file": "x_4.10.1_20200101-000000.tar.gz", "time": 1}, f)
     with open(os.path.join(other, "x_4.10.1_20200101-000000.tar.gz"), "wb") as f:
         f.write(b"x")
+    # A record edited by hand (a trailing comma, which jsonfilter lets pass
+    # but strict parsers such as the GL panel's do not) and one that is not
+    # JSON at all.
+    with open(os.path.join(other, "y_4.10.1_20200102-000000.json"), "w") as f:
+        f.write('{"format":1,"file":"y_4.10.1_20200102-000000.tar.gz","time":2,"packages":["a",],}')
+    with open(os.path.join(other, "y_4.10.1_20200102-000000.tar.gz"), "wb") as f:
+        f.write(b"y")
+    with open(os.path.join(other, "z.json"), "w") as f:
+        f.write('{"time":3, broken')
     out = run(r"""
 uci set autobackup.main.keep=3; uci commit autobackup
 for i in 1 2 3 4 5; do step=b$i; o autobackup backup; sleep 1; done
@@ -192,7 +201,10 @@ step=list; o autobackup list
     check(len(left) == 6, "keep 3: three backups (archive + record) are left of five (%d files)" % len(left))
     check(all(any(n.startswith(i.split("/")[1] + ".") for n in left) for i in made[2:]), "keep 3: the three newest")
     check(os.path.exists(os.path.join(other, "x_4.10.1_20200101-000000.tar.gz")), "keep: another router's backups are not touched")
-    check(len(read(out, "list").get("backups", [])) == 4, "list: shows other routers' backups on the drive too")
+    lst = read(out, "list")
+    check(len(lst.get("backups", [])) == 5, "list: shows other routers' backups on the drive too")
+    check("_unparsed" not in lst and any(b.get("packages") == ["a"] for b in lst.get("backups", [])),
+          "list: strict JSON even with a hand-edited record (rewritten); a record that is not JSON is left out")
 
     # ------------------------------------------------------- missing drive
     out = run(r"""
@@ -252,6 +264,8 @@ cp /etc/crontabs/root /out/cron_removed.txt
     nr = read(out, "st_daily").get("next_run", 0)
     import time as _t
     tm = _t.gmtime(nr)
+    sd = read(out, "st_daily")
+    check((sd.get("schedule"), sd.get("hour"), sd.get("minute")) == ("daily", 4, 5), "status: the schedule's time (for the pages)")
     check(now < nr <= now + 86400 and (tm.tm_hour, tm.tm_min, tm.tm_sec) == (4, 5, 0),
           "status: next daily run is the next 04:05 (container time is UTC)")
     cron = read(out, "cron_weekly", "txt").splitlines()

@@ -14,6 +14,9 @@ can take away.
 It appears in GL's own admin panel (**System → Auto Backup**) and, where
 LuCI is installed, in LuCI (**System → Auto Backup**).
 
+![Auto Backup's Status page in the GL.iNet admin panel (demo data)](docs/status.png)
+<sub>Status, in the GL.iNet admin panel (demo data).</sub>
+
 > [!WARNING]
 > **Tested so far only on a GL.iNet GL-BE9300 (Flint 3) with firmware
 > 4.10.1**, both as the main router and as a mesh node. It should work on any
@@ -127,12 +130,16 @@ Shows:
 
 ### Backups
 
+![The Backups page (demo data)](docs/backups.png)
+
 Lists the backups on the drive, newest first. Each one can be
 **downloaded**, **restored** or **deleted**. Backups of other routers on
 the same drive are shown too, and marked as such.
 **Upload a backup and restore it…** restores a file from your computer.
 
 ### Settings
+
+![The Settings page (demo data)](docs/settings.png)
 
 | Setting | |
 |---|---|
@@ -178,6 +185,8 @@ openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in backup.tar.gz.enc -out back
      passphrase it was made with;
    - **add-ons** the backup had that aren't installed: reinstall them,
      before or after.
+   ![The restore dialog: a backup from older firmware, with an add-on that is no longer installed (demo data)](docs/restore.png)
+
 3. Choose **Restore and restart**. The router's settings are replaced and it
    restarts. Everything connected loses its connection for a minute or two.
    If the backup has another router address or Wi-Fi network, reconnect to
@@ -190,6 +199,10 @@ that time.
 > [!TIP]
 > Have mesh nodes? Try your first restore on a node rather than the main
 > router. If something goes wrong, the rest of the network stays up.
+
+The pages follow the GL panel's light or dark theme.
+
+![The Backups page in the dark theme (demo data)](docs/backups-dark.png)
 
 ## Troubleshooting
 

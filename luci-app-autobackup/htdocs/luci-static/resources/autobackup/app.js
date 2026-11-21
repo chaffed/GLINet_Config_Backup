@@ -61,7 +61,7 @@ function two(n) { return (n < 10 ? '0' : '') + n; }
 function when(t) {
 	if (!t)
 		return _('never');
-	var d = new Date(t * 1000), ago = Math.round((Date.now() / 1000 - t) / 60), rel;
+	var ago = Math.round((Date.now() / 1000 - t) / 60), rel;
 	if (ago < 0)
 		rel = null;
 	else if (ago < 2)
@@ -72,7 +72,17 @@ function when(t) {
 		rel = _('%d hours ago').format(Math.round(ago / 60));
 	else
 		rel = _('%d days ago').format(Math.round(ago / 1440));
-	return d.toLocaleString() + (rel ? ' (' + rel + ')' : '');
+	return stamp(t) + (rel ? ' (' + rel + ')' : '');
+}
+
+/* A date and time, short ("Nov 21, 2026, 3:30 AM" in English). */
+function stamp(t) {
+	var d = new Date(t * 1000);
+	try {
+		return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+	} catch (e) {
+		return d.toLocaleString();
+	}
 }
 
 function size(bytes) {
@@ -152,7 +162,7 @@ var CSS = [
 	'.autobackup-good{color:var(--success,#2e7d32);font-weight:600}',
 	'.autobackup-bad{color:var(--error,#c62828);font-weight:600}',
 	'.autobackup-actions{margin:16px 0 0;display:flex;flex-wrap:wrap;gap:8px;align-items:center}',
-	'.autobackup-row-actions{white-space:nowrap}',
+	'.autobackup-row-actions,.autobackup-nowrap{white-space:nowrap}',
 	'.autobackup-row-actions .cbi-button{margin:2px}',
 	'.autobackup-field{margin:10px 0}',
 	'.autobackup-field label{display:block;font-weight:600;margin:0 0 4px}',
@@ -242,7 +252,7 @@ return baseclass.extend({
 					row(_('USB drive'), drive),
 					row(_('Last backup'), lastText),
 					row(_('Last successful backup'), st.last_ok ? when(st.last_ok) : _('never')),
-					row(_('Schedule'), [ scheduleText(st) ].concat(st.next_run ? [ E('br'), _('Next: %s').format(new Date(st.next_run * 1000).toLocaleString()) ] : [])),
+					row(_('Schedule'), [ scheduleText(st) ].concat(st.next_run ? [ E('br'), _('Next: %s').format(stamp(st.next_run)) ] : [])),
 					row(_('Keep'), _('The newest %d backups of this router').format(st.keep)),
 					row(_('Encryption'), st.encrypt ? _('On (passphrase set)') : _('Off')),
 					row(_('This router'), [ (st.router.model_name || st.router.model || '?') + ' · ' + _('firmware %s').format(st.router.firmware || '?') ])
@@ -278,8 +288,8 @@ return baseclass.extend({
 				} }, [ _('Delete…') ])
 			];
 			return E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td' }, [ new Date(b.time * 1000).toLocaleString() ].concat(b.missing ? [ E('br'), E('em', { 'class': 'autobackup-bad' }, [ _('File missing') ]) ] : [])),
-				E('td', { 'class': 'td' }, [ size(b.size) ]),
+				E('td', { 'class': 'td autobackup-nowrap' }, [ stamp(b.time) ].concat(b.missing ? [ E('br'), E('em', { 'class': 'autobackup-bad' }, [ _('File missing') ]) ] : [])),
+				E('td', { 'class': 'td autobackup-nowrap' }, [ size(b.size) ]),
 				E('td', { 'class': 'td' }, [ String(b.hostname || '?') ].concat(mine ? [] : [ E('br'), E('em', {}, [ _('another router') ]) ])),
 				E('td', { 'class': 'td' }, [ String(b.model || '?') + ' · ' + String(b.firmware || '?') ]),
 				E('td', { 'class': 'td' }, [ b.encrypted ? _('Encrypted') : _('No') ]),
@@ -338,7 +348,7 @@ return baseclass.extend({
 			});
 		} }, [ _('Delete') ]);
 		env.ui.showModal(_('Delete this backup?'), [
-			E('p', {}, [ _('The backup made %s will be removed from the USB drive. This cannot be undone.').format(new Date(b.time * 1000).toLocaleString()) ]),
+			E('p', {}, [ _('The backup made %s will be removed from the USB drive. This cannot be undone.').format(stamp(b.time)) ]),
 			E('div', { 'class': 'right' }, [
 				E('button', { 'class': 'cbi-button', 'type': 'button', 'click': function() { env.ui.hideModal(); } }, [ _('Cancel') ]), ' ',
 				btn
@@ -367,7 +377,7 @@ return baseclass.extend({
 		close = E('button', { 'class': 'cbi-button', 'type': 'button', 'click': function() { env.ui.hideModal(); } }, [ _('Cancel') ]);
 
 		if (rec)
-			body.push(E('p', {}, [ _('Backup of %s made %s (%s, firmware %s).').format(String(rec.hostname || '?'), new Date(rec.time * 1000).toLocaleString(), String(rec.model || '?'), String(rec.firmware || '?')) ]));
+			body.push(E('p', {}, [ _('Backup of %s made %s (%s, firmware %s).').format(String(rec.hostname || '?'), stamp(rec.time), String(rec.model || '?'), String(rec.firmware || '?')) ]));
 		else
 			body.push(E('p', {}, [ _('Uploaded file: %s').format(String(fileName || '')) ]));
 

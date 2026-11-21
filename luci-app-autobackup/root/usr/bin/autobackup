@@ -45,7 +45,7 @@
 # SPDX-License-Identifier: MIT
 # shellcheck shell=dash
 
-VERSION=0.1.0
+VERSION=0.1.1
 
 STATE_DIR=/etc/autobackup
 LAST="$STATE_DIR/last"
@@ -578,6 +578,17 @@ records_by_time() {
 	done | sort -rn
 }
 
+# A record as strict JSON on one line. Records come from the drive, where
+# anyone may have edited them; jsonfilter reads them leniently (a trailing
+# comma passes) but the GL panel's JSON parser does not, so they are
+# written out again, and one that is not a JSON object is left out.
+clean_record() {
+	local out
+	[ "$(file_size "$1")" -le 65536 ] || return 1
+	out=$(jsonfilter -i "$1" -e '@' 2>/dev/null | tr -d '\n') || return 1
+	case "$out" in '{'*'}') printf '%s' "$out" ;; *) return 1 ;; esac
+}
+
 # The archive a record describes (only names in its own folder).
 archive_of() {
 	local f
@@ -605,7 +616,7 @@ prune() {
 # ------------------------------------------------------------ list/delete --
 
 cmd_list() {
-	local drive first=1 d t r r2 a missing
+	local drive first=1 d t r r2 a rec missing
 	printf '{'
 	if resolve_drive; then
 		drive=$DRIVE
@@ -616,12 +627,13 @@ cmd_list() {
 		done | sort -rn | while IFS="$(printf '\t')" read -r t r; do
 			missing=false
 			a=$(archive_of "$r") || continue
+			rec=$(clean_record "$r") || continue
 			[ -f "$a" ] || missing=true
 			[ $first = 1 ] || printf ','
 			first=0
 			r2=${r%.json}
 			# The record, with its id (folder/name) and whether its archive is there.
-			printf '%s' "$(sed "1s/^{/{\"id\":$(jstr "$(basename "${r%/*}")/${r2##*/}" | sed 's/[\/&]/\\&/g'),\"missing\":$missing,/" "$r")"
+			printf '%s' "$(printf '%s' "$rec" | sed "1s/^{/{\"id\":$(jstr "$(basename "${r%/*}")/${r2##*/}" | sed 's/[\/&]/\\&/g'),\"missing\":$missing,/")"
 		done
 		printf ']'
 	else
@@ -749,7 +761,7 @@ print_check() {
 	printf '],"encrypted":%s,"needs_passphrase":%s' "$(jbool "$SRC_ENCRYPTED")" "$(jbool "$NEEDS_PASS")"
 	printf ',"missing_packages":%s' "$(missing_packages | jlist)"
 	if [ -n "$SRC_RECORD" ]; then
-		printf ',"record":%s' "$(tr -d '\n' < "$SRC_RECORD")"
+		printf ',"record":%s' "$(clean_record "$SRC_RECORD" || echo null)"
 	else
 		printf ',"record":null'
 	fi
@@ -851,7 +863,8 @@ cmd_status() {
 	printf ',"router":{"hostname":%s,"model":%s,"model_name":%s,"board":%s,"firmware":%s}' \
 		"$(jstr "$(hostname_)")" "$(jstr "$(model)")" "$(jstr "$(model_name)")" "$(jstr "$(board)")" "$(jstr "$(firmware)")"
 	printf ',"tested":%s,"tested_on":%s' "$(jbool "$(is_tested)")" "$(jstr "$TESTED")"
-	printf ',"schedule":%s,"next_run":%s' "$(jstr "$(cfg schedule)")" "$(next_run)"
+	printf ',"schedule":%s,"weekday":%s,"hour":%s,"minute":%s,"next_run":%s' "$(jstr "$(cfg schedule)")" \
+		"$(num "$(cfg weekday)" 0)" "$(num "$(cfg hour)" 3)" "$(num "$(cfg minute)" 30)" "$(next_run)"
 	printf ',"keep":%s,"encrypt":%s,"passphrase_set":%s' "$(num "$(cfg keep)" 10)" \
 		"$(jbool "$(cfg encrypt)")" "$(jbool "$(passphrase_set)")"
 	printf '}\n'

@@ -113,7 +113,7 @@ exports.start = async function(opts) {
 		}
 
 		rig.browser = await playwright.chromium.launch(process.env.AB_CHROME ? { executablePath: process.env.AB_CHROME } : { channel: 'chrome' });
-		var ctx = await rig.browser.newContext({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
+		var ctx = await rig.browser.newContext({ viewport: { width: 1280, height: 900 }, acceptDownloads: true, timezoneId: opts.timezone, locale: opts.locale });
 		rig.page = await ctx.newPage();
 		/* Script errors count from here on (LuCI's login page answers 403). */
 		rig.watch = function() {

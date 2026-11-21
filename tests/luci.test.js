@@ -82,6 +82,9 @@ async function main() {
 		eq(router('uci get autobackup.main.schedule; uci get autobackup.main.weekday; uci get autobackup.main.hour; uci get autobackup.main.minute; uci get autobackup.main.keep').trim().split('\n'),
 			[ 'weekly', '2', '4', '15', '5' ], 'settings: the schedule and keep count are stored');
 		ok(/^15 4 \* \* 2 \/usr\/bin\/autobackup backup --scheduled/m.test(router('cat /etc/crontabs/root')), 'settings: cron runs it on Tuesdays at 04:15');
+		await open('status');
+		ok(/Every Tuesday at 04:15/.test(await page.innerText('#view')), 'status: shows the schedule with its day and time');
+		await open('settings');
 
 		await page.check('#autobackup-encrypt');
 		ok(await page.isVisible('#autobackup-pass'), 'settings: ticking encryption asks for a passphrase');
