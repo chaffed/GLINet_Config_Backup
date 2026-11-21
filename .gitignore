@@ -1,0 +1,19 @@
+# Router config backups contain secrets (Wi-Fi passwords, VPN keys, admin hashes).
+# Never commit them to this public repo.
+*.tar.gz
+*.tgz
+*.tar
+backups/
+backup/
+
+# Local secrets / env
+.env
+.env.*
+*.key
+*.pem
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# macOS
+.DS_Store
