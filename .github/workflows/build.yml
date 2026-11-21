@@ -39,10 +39,19 @@ jobs:
       - name: Test the backend (OpenWrt 23.05 container, a folder as the USB drive)
         run: python3 tests/backend.test.py
 
+      - name: Test the GL.iNet admin panel module
+        run: |
+          sudo apt-get install -y -qq lua5.1 lua-cjson >/dev/null
+          luac5.1 -p luci-app-autobackup/root/usr/lib/oui-httpd/rpc/autobackup luci-app-autobackup/root/usr/share/gl-validator.d/autobackup.lua tests/gl/rpc.lua tests/gl/upload.lua
+          lua5.1 tests/gl_rpc.test.lua
+
       - name: Test the pages in LuCI with a browser (OpenWrt 23.05 container)
         run: |
           npm install --no-save playwright-core
           node tests/luci.test.js
+
+      - name: Test the pages in the GL.iNet admin panel with a browser (stand-in panel, real module)
+        run: node tests/gl.test.js
 
       - uses: actions/upload-artifact@v4
         if: always()

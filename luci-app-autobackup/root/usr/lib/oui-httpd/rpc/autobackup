@@ -1,0 +1,203 @@
+--[[
+    @object-name: autobackup
+    @object-desc: Auto Backup (luci-app-autobackup) for the GL.iNet admin panel.
+
+    The panel only lets a logged-in administrator call these methods. They
+    run /usr/bin/autobackup without a shell (arguments are passed as a
+    list); the backend checks every value again and answers in JSON.
+
+    A passphrase goes in (set_passphrase, restore) and never comes out. The
+    panel's web server can give a command only arguments, which every
+    process on the router can read, so a passphrase never travels that way:
+    the backend makes a root-only file (passphrase-input), this module
+    writes the passphrase into it and passes the file's name.
+
+    The panel writes every call to the system log unless the method's name
+    contains "get", "load" or "check"; hence get_status, get_list and
+    check_restore, which the pages call often.
+
+    SPDX-License-Identifier: MIT
+--]]
+
+local cjson = require "cjson"
+
+local M = {}
+
+local BIN = "/usr/bin/autobackup"
+
+-- Run a command given as a list and return what it printed.
+-- The panel's web server provides its own ngx.pipe (it hands the command to
+-- gl-ngx-session), which only knows spawn(args, opts), stdout_read_all()
+-- and wait(); the options below mean the same to OpenResty's ngx.pipe.
+local function spawn(cmd, seconds)
+    local ms = (seconds or 30) * 1000
+    local proc = ngx.pipe.spawn(cmd, { stdout_read_timeout = ms, wait_timeout = ms })
+    if not proc then return "" end
+    local out = proc:stdout_read_all()
+    proc:wait()
+    return out or ""
+end
+
+local function run(args, seconds)
+    local cmd = { BIN }
+    for _, a in ipairs(args) do cmd[#cmd + 1] = a end
+    return spawn(cmd, seconds)
+end
+
+-- The backend's JSON. "ok": false with a reason is an answer, not an error
+-- (the pages show the reason), so it is passed on as it is; err_code and
+-- err_msg are only for when the backend did not answer at all.
+local function run_json(args, seconds)
+    local ok, res = pcall(cjson.decode, run(args, seconds))
+    if ok and type(res) == "table" then return res end
+    return { err_code = -1, err_msg = "Auto Backup did not answer" }
+end
+
+-- A backup's id (folder/name) or "upload".
+local function src_ok(v)
+    return type(v) == "string" and #v <= 200 and (v == "upload"
+        or (v:match("^[%w_%-][%w%._%-]*/[%w_%-][%w%._%-]*$") ~= nil and not v:find("%.%.")))
+end
+
+-- Hand a passphrase to the backend in a root-only file it made; returns
+-- the file's name.
+local function pass_file(p)
+    local path = run({ "passphrase-input" }, 10):match("^(/var/run/autobackup/input%.[%w]+)%s*$")
+    if not path then return nil end
+    local f = io.open(path, "w")
+    if not f then return nil end
+    f:write(p, "\n")
+    f:close()
+    return path
+end
+
+local function pass_ok(p)
+    return type(p) == "string" and #p >= 1 and #p <= 256 and not p:find("[%z\1-\31\127]")
+end
+
+--[[
+    @method-name: get_status
+    @method-desc: The drive, the last backup's result, the schedule and this router. Says whether a passphrase is set, never what it is.
+--]]
+M.get_status = function()
+    return run_json({ "status" })
+end
+
+--[[
+    @method-name: get_list
+    @method-desc: The backups on the drive, newest first, each with its record.
+--]]
+M.get_list = function()
+    return run_json({ "list" }, 60)
+end
+
+--[[
+    @method-name: backup
+    @method-desc: Back up now. Answers ok, or the reason it failed.
+--]]
+M.backup = function()
+    return run_json({ "backup" }, 300)
+end
+
+--[[
+    @method-name: delete
+    @method-desc: Delete one backup from the drive.
+    @in string id  The backup (folder/name, as get_list gives it).
+--]]
+M.delete = function(params)
+    local id = type(params) == "table" and params.id
+    if not src_ok(id) or id == "upload" then return { ok = false, reason = "not_found" } end
+    return run_json({ "delete", id }, 60)
+end
+
+--[[
+    @method-name: check_restore
+    @method-desc: Can this backup be restored here, and what to warn about (other firmware, unknown model, add-ons not installed, passphrase needed).
+    @in string src  A backup's id, or "upload" for the uploaded file.
+--]]
+M.check_restore = function(params)
+    local src = type(params) == "table" and params.src
+    if not src_ok(src) then return { restorable = false, blocked = "not_found" } end
+    return run_json({ "restore-check", src }, 120)
+end
+
+--[[
+    @method-name: restore
+    @method-desc: Restore a backup's settings and restart the router (after the same checks as check_restore).
+    @in string src                A backup's id, or "upload".
+    @in string passphrase         Only for an encrypted backup the stored passphrase does not open.
+    @in bool force_firmware       Restore although it was made on other firmware.
+    @in bool force_unverified     Restore an uploaded file whose model cannot be checked.
+--]]
+M.restore = function(params)
+    params = type(params) == "table" and params or {}
+    if not src_ok(params.src) then return { ok = false, reason = "not_found" } end
+    local args = { "restore", params.src, "--yes" }
+    if params.force_firmware == true then args[#args + 1] = "--force-firmware" end
+    if params.force_unverified == true then args[#args + 1] = "--force-unverified" end
+    local p = params.passphrase
+    if p ~= nil and p ~= "" then
+        if not pass_ok(p) then return { ok = false, reason = "wrong_passphrase" } end
+        local f = pass_file(p)
+        if not f then return { ok = false, reason = "no_input" } end
+        args[#args + 1] = "--passphrase-file"
+        args[#args + 1] = f
+    end
+    return run_json(args, 180)
+end
+
+-- Every setting the panel may change. The backend checks the values.
+local FIELDS = { schedule = true, weekday = true, hour = true, minute = true, keep = true, drive = true, encrypt = true }
+M.FIELDS = FIELDS
+
+--[[
+    @method-name: get_config
+    @method-desc: The settings. Says whether a passphrase is set, never what it is.
+--]]
+M.get_config = function()
+    return run_json({ "config" })
+end
+
+--[[
+    @method-name: set_config
+    @method-desc: Check and store settings, then apply the schedule. Nothing is stored unless every value is valid.
+    @in object values  setting -> value (strings, numbers or booleans)
+--]]
+M.set_config = function(params)
+    local values = type(params) == "table" and params.values
+    if type(values) ~= "table" then return { ok = false, reason = "nothing_to_set" } end
+    local args = { "set" }
+    for key, v in pairs(values) do
+        if type(key) ~= "string" or not FIELDS[key] then
+            return { ok = false, reason = "unknown_setting", field = tostring(key) }
+        end
+        if type(v) == "boolean" then
+            v = v and "1" or "0"
+        elseif type(v) == "number" then
+            v = string.format("%.0f", v)
+        elseif type(v) ~= "string" then
+            return { ok = false, reason = "invalid_value", field = key }
+        end
+        if #v > 200 or v:find("[%z\1-\31\127]") then
+            return { ok = false, reason = "invalid_value", field = key }
+        end
+        args[#args + 1] = key .. "=" .. v
+    end
+    if #args == 1 then return { ok = false, reason = "nothing_to_set" } end
+    return run_json(args, 30)
+end
+
+--[[
+    @method-name: set_passphrase
+    @method-desc: Store the passphrase (root-only file) and encrypt backups from now on. It cannot be read back.
+    @in string passphrase
+--]]
+M.set_passphrase = function(params)
+    local p = type(params) == "table" and params.passphrase
+    if not pass_ok(p) then return { ok = false, reason = "invalid_passphrase", field = "passphrase" } end
+    local f = pass_file(p)
+    if not f then return { ok = false, reason = "no_input" } end
+    return run_json({ "set-passphrase", f }, 30)
+end
+
+return M

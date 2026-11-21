@@ -1,0 +1,4 @@
+/tmp/mountd/[%w_%-]+/autobackup/[%w_%-][%w%._%-]*/[%w_%-][%w%._%-]*%.tar%.gz$
+/tmp/mountd/[%w_%-]+/autobackup/[%w_%-][%w%._%-]*/[%w_%-][%w%._%-]*%.tar%.gz%.enc$
+/mnt/[%w_%-]+/autobackup/[%w_%-][%w%._%-]*/[%w_%-][%w%._%-]*%.tar%.gz$
+/mnt/[%w_%-]+/autobackup/[%w_%-][%w%._%-]*/[%w_%-][%w%._%-]*%.tar%.gz%.enc$

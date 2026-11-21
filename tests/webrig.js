@@ -47,6 +47,11 @@ function docker(args, input) {
 }
 /* Run a shell script on the test router. */
 exports.router = function(script) { return docker([ 'exec', '-i', NAME, 'sh', '-s' ], script); };
+/* A file on the test router, as bytes; and writing one. */
+exports.routerRead = function(file) { return cp.execFileSync('docker', [ 'exec', NAME, 'cat', file ], { stdio: [ 'ignore', 'pipe', 'pipe' ] }); };
+exports.routerWrite = function(file, buf) { cp.execFileSync('docker', [ 'exec', '-i', NAME, 'sh', '-c', 'cat > "$0"', file ], { input: buf }); };
+/* A value for a shell script, in single quotes. */
+exports.q = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; };
 function get(url) {
 	return new Promise(function(resolve, reject) {
 		http.get(url, function(res) { res.resume(); resolve(res.statusCode); }).on('error', reject);
