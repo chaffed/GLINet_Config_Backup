@@ -1,0 +1,9 @@
+
+config autobackup 'main'
+	option schedule 'off'
+	option weekday '0'
+	option hour '3'
+	option minute '30'
+	option keep '10'
+	option drive ''
+	option encrypt '0'

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Auto Backup (luci-app-autobackup): placeholder, replaced in #3.
+# SPDX-License-Identifier: MIT
+VERSION=0.1.0
+case "$1" in
+	version) echo "$VERSION" ;;
+	*) echo "usage: autobackup version" >&2; exit 2 ;;
+esac

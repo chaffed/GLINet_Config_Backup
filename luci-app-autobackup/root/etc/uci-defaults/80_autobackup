@@ -1,0 +1,12 @@
+#!/bin/sh
+# First run after install or upgrade.
+touch /etc/config/autobackup_auth
+chmod 600 /etc/config/autobackup_auth
+uci -q get autobackup_auth.main >/dev/null || { uci set autobackup_auth.main=auth; uci commit autobackup_auth; }
+chmod 600 /etc/config/autobackup_auth
+# When settings are kept across an upgrade, opkg leaves the package's own
+# copies next to them; nothing reads those.
+rm -f /etc/config/autobackup-opkg /etc/config/autobackup_auth-opkg
+mkdir -p /etc/autobackup
+chmod 700 /etc/autobackup
+exit 0
