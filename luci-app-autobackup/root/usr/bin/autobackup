@@ -5,6 +5,9 @@
 #   autobackup backup [--scheduled]  save a backup now (prints JSON)
 #   autobackup list                  backups on the drive (JSON)
 #   autobackup delete ID             remove one backup (ID = folder/name)
+#   autobackup restore-check SRC     can SRC be restored here? (JSON; SRC = ID or "upload")
+#   autobackup restore SRC --yes [--passphrase-file F] [--force-firmware] [--force-unverified]
+#                                    restore SRC's settings and reboot
 #   autobackup status                drive, last result, schedule (JSON)
 #   autobackup config                the settings (JSON; never the passphrase)
 #   autobackup set KEY=VALUE...      check and store settings, then apply the schedule
@@ -48,6 +51,10 @@ STATE_DIR=/etc/autobackup
 LAST="$STATE_DIR/last"
 LOCK=/var/lock/autobackup.lock
 TMP_DIR=/tmp/autobackup
+# A backup uploaded from a computer (LuCI's and the GL panel's upload write
+# it here).
+UPLOAD=/tmp/autobackup-upload
+RESTORED="$STATE_DIR/restored"
 MOUNTS=/proc/mounts
 RUN_DIR=/var/run/autobackup
 AUTH=/etc/config/autobackup_auth
@@ -646,6 +653,179 @@ cmd_delete() {
 	printf '{"ok":true}\n'
 }
 
+# ---------------------------------------------------------------- restore --
+
+# Packages installed now, one per line.
+installed_packages() {
+	awk '/^Package:/ { p = $2 } /^Status:/ && / installed/ { print p }' /usr/lib/opkg/status 2>/dev/null | sort -u
+}
+
+# Does a .tar.gz look like a sysupgrade backup (settings under etc/)?
+is_backup_archive() {
+	gzip -t "$1" 2>/dev/null && tar tzf "$1" 2>/dev/null | grep -q '^\(\./\)\?etc/'
+}
+
+is_encrypted_file() {
+	[ "$(head -c 8 "$1" 2>/dev/null)" = "Salted__" ]
+}
+
+# decrypt IN OUT PASSFILE
+decrypt() {
+	openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$1" -out "$2" -pass "file:$3" 2>/dev/null &&
+		is_backup_archive "$2"
+}
+
+# Look a source over. Sets:
+#   SRC_ARCHIVE SRC_RECORD (empty for an upload) SRC_ENCRYPTED 0|1
+#   BLOCKED     why it can never be restored here (empty: it can)
+#   WARNINGS    space-separated: other_firmware, unverified
+#   PLAIN       the decrypted (or plain) archive, when it could be opened
+#   NEEDS_PASS  1: encrypted and no passphrase that opens it was given
+# $2: a passphrase file from passphrase-input (or empty: the stored one).
+examine() {
+	local src="$1" given="$2" r m b fw sum
+	SRC_ARCHIVE="" SRC_RECORD="" SRC_ENCRYPTED=0 BLOCKED="" WARNINGS="" PLAIN="" NEEDS_PASS=0
+	work_file restore
+	if [ "$src" = upload ]; then
+		[ -s "$UPLOAD" ] || { BLOCKED=not_found; return; }
+		chmod 600 "$UPLOAD"
+		SRC_ARCHIVE=$UPLOAD
+		WARNINGS="unverified"
+	else
+		r=$(record_path "$src") || { BLOCKED=not_found; return; }
+		SRC_RECORD=$r
+		SRC_ARCHIVE=$(archive_of "$r") || { BLOCKED=not_found; return; }
+		[ -f "$SRC_ARCHIVE" ] || { BLOCKED=archive_missing; return; }
+		sum=$(jsonfilter -i "$r" -e '@.sha256' 2>/dev/null)
+		[ "$(sha256 "$SRC_ARCHIVE")" = "$sum" ] || { BLOCKED=checksum_mismatch; return; }
+		# Same model and board, or not at all.
+		m=$(jsonfilter -i "$r" -e '@.model' 2>/dev/null)
+		b=$(jsonfilter -i "$r" -e '@.board' 2>/dev/null)
+		if [ "$m" != "$(model)" ] || [ "$b" != "$(board)" ]; then
+			BLOCKED=other_model
+			return
+		fi
+		fw=$(jsonfilter -i "$r" -e '@.firmware' 2>/dev/null)
+		[ "$fw" = "$(firmware)" ] || WARNINGS="other_firmware"
+	fi
+
+	if is_encrypted_file "$SRC_ARCHIVE"; then
+		SRC_ENCRYPTED=1
+		if [ -n "$given" ]; then
+			read_input "$given" > "$WORK.pass" || { NEEDS_PASS=1; return; }
+		else
+			passphrase_file "$WORK.pass" || { NEEDS_PASS=1; return; }
+		fi
+		if decrypt "$SRC_ARCHIVE" "$WORK.tar.gz" "$WORK.pass"; then
+			PLAIN="$WORK.tar.gz"
+		else
+			NEEDS_PASS=1
+		fi
+		rm -f "$WORK.pass"
+	elif is_backup_archive "$SRC_ARCHIVE"; then
+		PLAIN=$SRC_ARCHIVE
+	else
+		BLOCKED=not_a_backup
+	fi
+}
+
+# Packages the record lists that are not installed now.
+missing_packages() {
+	[ -n "$SRC_RECORD" ] || return 0
+	installed_packages > "$WORK.now"
+	jsonfilter -i "$SRC_RECORD" -e '@.packages[*]' 2>/dev/null | sort -u | grep -vxF -f "$WORK.now"
+	rm -f "$WORK.now"
+}
+
+print_check() {
+	local w first=1
+	printf '{"restorable":%s,"blocked":%s' "$(jbool "$([ -z "$BLOCKED" ] && [ "$NEEDS_PASS" = 0 ] && echo 1)")" "$(jstr "$BLOCKED")"
+	printf ',"warnings":['
+	for w in $WARNINGS; do
+		[ $first = 1 ] || printf ','
+		first=0
+		jstr "$w"
+	done
+	printf '],"encrypted":%s,"needs_passphrase":%s' "$(jbool "$SRC_ENCRYPTED")" "$(jbool "$NEEDS_PASS")"
+	printf ',"missing_packages":%s' "$(missing_packages | jlist)"
+	if [ -n "$SRC_RECORD" ]; then
+		printf ',"record":%s' "$(tr -d '\n' < "$SRC_RECORD")"
+	else
+		printf ',"record":null'
+	fi
+	printf ',"router":{"model":%s,"board":%s,"firmware":%s}}\n' "$(jstr "$(model)")" "$(jstr "$(board)")" "$(jstr "$(firmware)")"
+}
+
+cmd_restore_check() {
+	[ -n "$1" ] || { printf '{"restorable":false,"blocked":"not_found"}\n'; exit 1; }
+	examine "$1" ""
+	print_check
+}
+
+cmd_restore() {
+	local src="$1" yes=0 pass="" force_fw=0 force_unv=0 w detail
+	[ $# -gt 0 ] && shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--yes) yes=1 ;;
+			--passphrase-file) pass="$2"; shift ;;
+			--force-firmware) force_fw=1 ;;
+			--force-unverified) force_unv=1 ;;
+			*) printf '{"ok":false,"reason":"bad_option"}\n'; exit 2 ;;
+		esac
+		shift
+	done
+	if [ $yes = 0 ]; then
+		[ -n "$pass" ] && read_input "$pass" >/dev/null
+		printf '{"ok":false,"reason":"not_confirmed"}\n'
+		exit 1
+	fi
+	if ! lock; then
+		[ -n "$pass" ] && read_input "$pass" >/dev/null
+		printf '{"ok":false,"reason":"busy"}\n'
+		exit 1
+	fi
+	examine "$src" "$pass"
+	if [ -n "$BLOCKED" ]; then
+		printf '{"ok":false,"reason":%s}\n' "$(jstr "$BLOCKED")"
+		exit 1
+	fi
+	if [ "$NEEDS_PASS" = 1 ]; then
+		if [ -n "$pass" ]; then
+			printf '{"ok":false,"reason":"wrong_passphrase"}\n'
+		else
+			printf '{"ok":false,"reason":"needs_passphrase"}\n'
+		fi
+		exit 1
+	fi
+	for w in $WARNINGS; do
+		case "$w" in
+			other_firmware) [ $force_fw = 1 ] || { printf '{"ok":false,"reason":"other_firmware"}\n'; exit 1; } ;;
+			unverified) [ $force_unv = 1 ] || { printf '{"ok":false,"reason":"unverified"}\n'; exit 1; } ;;
+		esac
+	done
+
+	log "restoring settings from ${SRC_RECORD:-an uploaded file}"
+	if ! detail=$(sysupgrade -r "$PLAIN" 2>&1); then
+		log "restore failed: $detail"
+		printf '{"ok":false,"reason":"restore_failed","detail":%s}\n' "$(jstr "$(printf '%s' "$detail" | tail -n 1)")"
+		exit 1
+	fi
+	[ "$src" = upload ] && rm -f "$UPLOAD"
+	mkdir -p "$STATE_DIR"
+	printf 'time=%s\nsource=%s\n' "$(date +%s)" "$src" > "$RESTORED"
+	sync
+	log "settings restored; restarting the router"
+	# Restart once this answer has reached the page, in a session of its
+	# own so that the web server finishing the request does not stop it.
+	if command -v setsid >/dev/null; then
+		setsid sh -c 'sleep 3; reboot' >/dev/null 2>&1 </dev/null &
+	else
+		( sleep 3; reboot ) >/dev/null 2>&1 </dev/null &
+	fi
+	printf '{"ok":true,"rebooting":true}\n'
+}
+
 # ----------------------------------------------------------------- status --
 
 cmd_status() {
@@ -685,6 +865,8 @@ case "$cmd" in
 	backup) cmd_backup "$@" ;;
 	list) cmd_list ;;
 	delete) cmd_delete "$1" ;;
+	restore-check) cmd_restore_check "$1" ;;
+	restore) cmd_restore "$@" ;;
 	status) cmd_status ;;
 	config) cmd_config ;;
 	set) cmd_set "$@" ;;

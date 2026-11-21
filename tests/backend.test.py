@@ -56,11 +56,23 @@ o() { "$@" > "/out/$step.json" 2>"/out/$step.err"; echo $? > "/out/$step.rc"; }
 """
 
 
-def run(script, drive=None, name="run"):
+# A restore writes the whole backup over /etc; Docker mounts its own
+# /etc/hosts, /etc/hostname and /etc/resolv.conf there, which cannot be
+# replaced (on a router nothing is mounted there). Restore tests run
+# privileged and unmount them first; reboot is replaced by a marker.
+RESTORE_SETUP = r"""
+umount /etc/hosts /etc/hostname /etc/resolv.conf 2>/dev/null
+rm -f /sbin/reboot
+printf '#!/bin/sh\ndate +%s >> /out/rebooted.txt\n' > /sbin/reboot
+chmod 755 /sbin/reboot
+"""
+
+
+def run(script, drive=None, name="run", restore=False):
     """Run SETUP + script in a container; /out is a fresh folder returned to
     the caller, and `drive` (a folder here) is mounted as the USB drive."""
     out = tempfile.mkdtemp(prefix=name + "-", dir=os.path.join(ROOT, ".test-out"))
-    args = ["docker", "run", "--rm", "--platform", "linux/amd64",
+    args = ["docker", "run", "--rm", "--platform", "linux/amd64"] + (["--privileged"] if restore else []) + [
             "-v", os.path.join(ROOT, "luci-app-autobackup", "root") + ":/pkg:ro",
             "-v", out + ":/out"]
     if drive:
@@ -68,7 +80,7 @@ def run(script, drive=None, name="run"):
     # The backend writes root-only files (umask 077); on Linux the test
     # (not root) could not read them back.
     tail = "\nchmod -R a+rwX /out %s 2>/dev/null; true\n" % (DRIVE if drive else "")
-    subprocess.run(args + [IMAGE, "sh", "-c", SETUP + script + tail], check=True)
+    subprocess.run(args + [IMAGE, "sh", "-c", SETUP + (RESTORE_SETUP if restore else "") + script + tail], check=True)
     return out
 
 
@@ -348,6 +360,171 @@ true
             if not n.endswith(".enc") and PASSPHRASE.encode() in open(os.path.join(dp, n), "rb").read():
                 leaked_drive.append(n)
     check(leaked_drive == [], "passphrase: on the drive only inside encrypted files (%s)" % leaked_drive)
+
+    # ------------------------------------------------------------- restore
+    drive = os.path.join(work, "restore")
+    os.makedirs(drive)
+    out = run(r"""
+H=/tmp/mountd/disk1_part1/autobackup/GL-BE9300
+domain() { uci -q get dhcp.@dnsmasq[0].domain; }
+uci set dhcp.@dnsmasq[0].domain=before; uci commit dhcp
+step=b; o autobackup backup
+id=$(jsonfilter -i /out/b.json -e @.id); n=${id#*/}
+uci set dhcp.@dnsmasq[0].domain=after; uci commit dhcp
+
+# Copies of the backup with records edited to other routers and firmware.
+copy() { # copy NEW 'sed expression for the record'
+	cp "$H/$n.tar.gz" "$H/$1.tar.gz"
+	sed -e "s/\"file\":\"$n.tar.gz\"/\"file\":\"$1.tar.gz\"/" -e "$2" "$H/$n.json" > "$H/$1.json"
+}
+copy othermodel 's/"model":"[^"]*"/"model":"mt6000"/'
+copy otherboard 's/"board":"[^"]*"/"board":"glinet,gl-mt6000"/'
+copy otherfw 's/"firmware":"4.10.1"/"firmware":"4.9.0"/'
+copy extrapkg 's/"packages":\[/"packages":["luci-app-not-here",/'
+copy damaged 's/x/x/'; echo x >> "$H/damaged.tar.gz"
+copy gone 's/x/x/'; rm "$H/gone.tar.gz"
+
+step=check; o autobackup restore-check "$id"
+step=check_model; o autobackup restore-check GL-BE9300/othermodel
+step=check_board; o autobackup restore-check GL-BE9300/otherboard
+step=check_fw; o autobackup restore-check GL-BE9300/otherfw
+step=check_pkg; o autobackup restore-check GL-BE9300/extrapkg
+step=check_damaged; o autobackup restore-check GL-BE9300/damaged
+step=check_gone; o autobackup restore-check GL-BE9300/gone
+step=check_none; o autobackup restore-check GL-BE9300/nothing
+step=check_bad; o autobackup restore-check ../../etc/passwd
+
+step=noyes; o autobackup restore "$id"
+step=model; o autobackup restore GL-BE9300/othermodel --yes --force-firmware --force-unverified
+step=damaged; o autobackup restore GL-BE9300/damaged --yes
+step=fw; o autobackup restore GL-BE9300/otherfw --yes
+echo "$(domain)" > /out/domain_refused.txt
+[ -e /out/rebooted.txt ] && echo yes > /out/rebooted_early.txt
+
+step=restore; o autobackup restore "$id" --yes
+sleep 5
+echo "$(domain)" > /out/domain_restored.txt
+cat /etc/autobackup/restored > /out/restored_state.txt
+
+uci set dhcp.@dnsmasq[0].domain=after2; uci commit dhcp
+step=fw_forced; o autobackup restore GL-BE9300/otherfw --yes --force-firmware
+sleep 5
+echo "$(domain)" > /out/domain_forced.txt
+
+# A file uploaded from a computer: no record, so the model cannot be checked.
+uci set dhcp.@dnsmasq[0].domain=after3; uci commit dhcp
+cp "$H/$n.tar.gz" /tmp/autobackup-upload
+step=check_upload; o autobackup restore-check upload
+step=upload_refused; o autobackup restore upload --yes
+step=upload; o autobackup restore upload --yes --force-unverified
+sleep 5
+echo "$(domain)" > /out/domain_upload.txt
+[ -e /tmp/autobackup-upload ] && echo left > /out/upload_left.txt
+echo 'not a backup at all' > /tmp/autobackup-upload
+step=check_junk; o autobackup restore-check upload
+printf 'x' | gzip > /tmp/autobackup-upload
+step=check_gzjunk; o autobackup restore-check upload
+rm -f /tmp/autobackup-upload
+step=check_noupload; o autobackup restore-check upload
+step=empty; o autobackup restore
+wc -l < /out/rebooted.txt > /out/reboots.txt
+ls -A /tmp/autobackup > /out/tmp_left.txt 2>&1
+""", drive, "restore", restore=True)
+    c = read(out, "check")
+    check(c.get("restorable") is True and c.get("blocked") == "" and c.get("warnings") == [] and c.get("encrypted") is False,
+          "restore-check: this router's own backup can be restored")
+    check(c.get("record", {}).get("sha256") and c.get("router", {}).get("firmware") == "4.10.1", "restore-check: shows the record and this router")
+    check(c.get("missing_packages") == [], "restore-check: no add-ons missing when all are installed")
+    check(read(out, "check_pkg").get("missing_packages") == ["luci-app-not-here"], "restore-check: lists add-ons the backup had that are not installed")
+    check(read(out, "check_model").get("blocked") == "other_model" and read(out, "check_model").get("restorable") is False,
+          "restore-check: another model is blocked")
+    check(read(out, "check_board").get("blocked") == "other_model", "restore-check: another board is blocked")
+    f = read(out, "check_fw")
+    check(f.get("restorable") is True and f.get("warnings") == ["other_firmware"], "restore-check: other firmware is a warning")
+    check(read(out, "check_damaged").get("blocked") == "checksum_mismatch", "restore-check: a damaged archive is blocked (sha256)")
+    check(read(out, "check_gone").get("blocked") == "archive_missing", "restore-check: a record without its archive is blocked")
+    check(read(out, "check_none").get("blocked") == "not_found" and read(out, "check_bad").get("blocked") == "not_found",
+          "restore-check: unknown and unsafe names are not found")
+    check(read(out, "noyes").get("reason") == "not_confirmed", "restore: refused without --yes")
+    check(read(out, "model").get("reason") == "other_model", "restore: another model is refused, whatever the options")
+    check(read(out, "damaged").get("reason") == "checksum_mismatch", "restore: a damaged archive is refused")
+    check(read(out, "fw").get("reason") == "other_firmware", "restore: other firmware is refused without --force-firmware")
+    check(read(out, "domain_refused", "txt") == "after" and read(out, "rebooted_early", "txt") is None,
+          "restore: refusals change nothing and do not restart the router")
+    check(read(out, "restore") == {"ok": True, "rebooting": True}, "restore: succeeds and says the router restarts")
+    check(read(out, "domain_restored", "txt") == "before", "restore: the settings are those of the backup")
+    check("source=" + read(out, "b").get("id", "?") in (read(out, "restored_state", "txt") or ""), "restore: noted in /etc/autobackup/restored")
+    check(read(out, "domain_forced", "txt") == "before", "restore: other firmware with --force-firmware")
+    u = read(out, "check_upload")
+    check(u.get("restorable") is True and u.get("warnings") == ["unverified"] and u.get("record") is None,
+          "upload: can be restored, with the warning that its model cannot be checked")
+    check(read(out, "upload_refused").get("reason") == "unverified", "upload: refused without --force-unverified")
+    check(read(out, "domain_upload", "txt") == "before" and read(out, "upload_left", "txt") is None,
+          "upload: restored with --force-unverified, and the uploaded file is removed")
+    check(read(out, "check_junk").get("blocked") == "not_a_backup" and read(out, "check_gzjunk").get("blocked") == "not_a_backup",
+          "upload: a file that is not a backup is blocked")
+    check(read(out, "check_noupload").get("blocked") == "not_found", "upload: nothing uploaded, not found")
+    check(read(out, "empty").get("reason") == "not_confirmed" and read(out, "empty", "rc") == "1", "restore: no arguments is refused cleanly")
+    check(read(out, "reboots", "txt") == "3", "restore: the router restarts once per restore (3)")
+    check(read(out, "tmp_left", "txt") == "", "restore: no decrypted or scratch files are left behind")
+
+    # --------------------------------------------------- encrypted restore
+    drive = os.path.join(work, "restore_enc")
+    os.makedirs(drive)
+    with open(os.path.join(drive, "..pass"), "w") as f:
+        f.write(PASSPHRASE + "\n")
+    out = run(r"""
+pass=$(cat /tmp/mountd/disk1_part1/..pass); rm /tmp/mountd/disk1_part1/..pass
+H=/tmp/mountd/disk1_part1/autobackup/GL-BE9300
+domain() { uci -q get dhcp.@dnsmasq[0].domain; }
+setpass() { f=$(autobackup passphrase-input); printf '%s\n' "$1" > "$f"; autobackup set-passphrase "$f" >/dev/null; }
+uci set dhcp.@dnsmasq[0].domain=encrypted; uci commit dhcp
+setpass "$pass"
+step=b; o autobackup backup
+id=$(jsonfilter -i /out/b.json -e @.id)
+uci set dhcp.@dnsmasq[0].domain=later; uci commit dhcp
+step=check_stored; o autobackup restore-check "$id"
+# A new passphrase: the old backup needs the old one typed in.
+setpass 'a different passphrase'
+step=check_new; o autobackup restore-check "$id"
+step=nopass; o autobackup restore "$id" --yes
+f=$(autobackup passphrase-input); printf '%s\n' 'wrong wrong wrong' > "$f"
+step=wrong; o autobackup restore "$id" --yes --passphrase-file "$f"
+[ -e "$f" ] && echo left > /out/wrong_left.txt
+echo "$(domain)" > /out/domain_wrong.txt
+( while :; do for c in /proc/[0-9]*/cmdline; do tr '\0' ' ' < "$c" 2>/dev/null; echo; done; done >> /out/cmdlines.txt ) &
+watch=$!
+f=$(autobackup passphrase-input); printf '%s\n' "$pass" > "$f"
+step=right; o autobackup restore "$id" --yes --passphrase-file "$f"
+kill $watch 2>/dev/null; wait $watch 2>/dev/null
+sleep 5
+[ -e "$f" ] && echo left > /out/right_left.txt
+echo "$(domain)" > /out/domain_right.txt
+uci -q get autobackup_auth.main.passphrase > /out/pass_after.txt
+cp "$(ls $H/*.enc | head -n 1)" /tmp/autobackup-upload
+step=check_upload; o autobackup restore-check upload
+ls -A /tmp/autobackup > /out/tmp_left.txt 2>&1
+grep -rlF -- "$pass" /tmp /var/run /out/*.json 2>/dev/null | grep -v '^/tmp/mountd' > /out/leaks.txt
+true
+""", drive, "restore_enc", restore=True)
+    c = read(out, "check_stored")
+    check(c.get("restorable") is True and c.get("encrypted") is True and c.get("needs_passphrase") is False,
+          "encrypted restore-check: opens with the stored passphrase")
+    c = read(out, "check_new")
+    check(c.get("restorable") is False and c.get("needs_passphrase") is True and c.get("blocked") == "",
+          "encrypted restore-check: after a passphrase change, asks for the old one")
+    check(read(out, "nopass").get("reason") == "needs_passphrase", "encrypted restore: refused without a passphrase that opens it")
+    check(read(out, "wrong").get("reason") == "wrong_passphrase" and read(out, "wrong_left", "txt") is None
+          and read(out, "domain_wrong", "txt") == "later", "encrypted restore: a wrong passphrase changes nothing; its file is deleted")
+    check(read(out, "right") == {"ok": True, "rebooting": True} and read(out, "domain_right", "txt") == "encrypted"
+          and read(out, "right_left", "txt") is None, "encrypted restore: the typed passphrase restores the settings")
+    check(read(out, "pass_after", "txt") == PASSPHRASE, "encrypted restore: brings back the passphrase of that time")
+    cu = read(out, "check_upload")
+    check(cu.get("encrypted") is True and cu.get("restorable") is True, "encrypted upload: recognised, opens with the stored passphrase")
+    check(PASSPHRASE not in read(out, "cmdlines", "txt") and "openssl" in read(out, "cmdlines", "txt"),
+          "encrypted restore: the passphrase is never in a command line")
+    check(read(out, "tmp_left", "txt") == "" and read(out, "leaks", "txt") == "",
+          "encrypted restore: no decrypted archive or passphrase left behind (%s)" % read(out, "leaks", "txt"))
 
     # ------------------------------------------------- delete, busy, names
     drive = os.path.join(work, "delete")
