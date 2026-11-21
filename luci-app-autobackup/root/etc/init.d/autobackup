@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# Auto Backup: keeps the schedule in root's crontab in line with the
+# settings. Nothing runs in the background; cron starts each backup.
+# shellcheck shell=dash disable=SC2034
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	/usr/bin/autobackup cron-sync
+}
+
+reload_service() {
+	/usr/bin/autobackup cron-sync
+}
+
+# "Save & Apply" in LuCI (uci commit + reload_config) applies a new schedule.
+service_triggers() {
+	procd_add_reload_trigger autobackup
+}

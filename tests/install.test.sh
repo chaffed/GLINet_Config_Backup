@@ -34,15 +34,18 @@ check "[ \"\$(autobackup version)\" = \"$VERSION\" ]" "clean install: the progra
 check "[ \"\$(mode /etc/config/autobackup_auth)\" = -rw------- ]" "clean install: the passphrase file is readable by root only"
 check "[ \"\$(uci -q get autobackup.main.schedule)\" = off ] && [ \"\$(uci -q get autobackup.main.keep)\" = 10 ]" "clean install: default settings (no schedule, keep 10)"
 check "[ ! -e /etc/uci-defaults/80_autobackup ] && [ -d /etc/autobackup ]" "clean install: the first-run script ran"
+check "[ -x /etc/init.d/autobackup ] && ls /etc/rc.d/ | grep -q autobackup" "clean install: the schedule is applied at every start"
+check "! grep -q autobackup /etc/crontabs/root 2>/dev/null" "clean install: no schedule until one is chosen"
 
 # what the owner then does
-uci set autobackup.main.keep=7
-uci set autobackup.main.hour=4
-uci commit autobackup
+mkdir -p /etc/crontabs
+echo "0 1 * * * /bin/someone-elses-job" >> /etc/crontabs/root
+autobackup set keep=7 hour=4 schedule=daily >/dev/null
 uci set autobackup_auth.main.passphrase="it'"'"'s a secret"
 uci commit autobackup_auth
 kept() {
 	[ "$(uci -q get autobackup.main.keep)" = 7 ] && [ "$(uci -q get autobackup.main.hour)" = 4 ] &&
+	grep -q "^30 4 \* \* \* /usr/bin/autobackup backup --scheduled" /etc/crontabs/root &&
 	[ "$(uci -q get autobackup_auth.main.passphrase)" = "it'"'"'s a secret" ] &&
 	[ "$(mode /etc/config/autobackup_auth)" = -rw------- ]
 }
@@ -55,10 +58,11 @@ check "! ls /etc/config/ | grep -q -- -opkg" "upgrade: no stray copies of the se
 
 # ------------------------------------------------------ remove, install again
 opkg remove luci-app-autobackup >/tmp/remove.log 2>&1 || cat /tmp/remove.log
-check "[ ! -e /usr/bin/autobackup ]" "remove: the program is gone"
+check "[ ! -e /usr/bin/autobackup ] && [ ! -e /etc/init.d/autobackup ] && ! ls /etc/rc.d/ | grep -q autobackup" "remove: the program and its start script are gone"
+check "! grep -q autobackup /etc/crontabs/root && grep -q someone-elses-job /etc/crontabs/root" "remove: the schedule is taken out of cron, other jobs stay"
 check "[ -s /etc/config/autobackup ] && [ -s /etc/config/autobackup_auth ]" "remove: settings and passphrase stay on the router"
 opkg install "$this" >/tmp/again.log 2>&1 || cat /tmp/again.log
-check kept "install again: picks up the kept settings and passphrase"
+check kept "install again: picks up the kept settings and passphrase, and the schedule is back in cron"
 check "! ls /etc/config/ | grep -q -- -opkg" "install again: no stray copies"
 
 [ "$fail" = 0 ] && echo && echo "all checks passed"

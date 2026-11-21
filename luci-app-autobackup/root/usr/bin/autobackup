@@ -6,6 +6,10 @@
 #   autobackup list                  backups on the drive (JSON)
 #   autobackup delete ID             remove one backup (ID = folder/name)
 #   autobackup status                drive, last result, schedule (JSON)
+#   autobackup config                the settings (JSON; never the passphrase)
+#   autobackup set KEY=VALUE...      check and store settings, then apply the schedule
+#   autobackup cron-sync             write the schedule into cron (init script)
+#   autobackup cron-remove           take it out of cron (package removal)
 #   autobackup version
 #
 # Where things are:
@@ -34,6 +38,8 @@ LAST="$STATE_DIR/last"
 LOCK=/var/lock/autobackup.lock
 TMP_DIR=/tmp/autobackup
 MOUNTS=/proc/mounts
+CRONTAB=/etc/crontabs/root
+CRON_MARK="# autobackup"
 # Only this model and firmware have been tested so far; the pages say so.
 TESTED="be9300:4.10.1"
 
@@ -229,6 +235,147 @@ fail() {
 	exit 1
 }
 
+# --------------------------------------------------------------- settings --
+
+# check_setting KEY VALUE: is VALUE allowed for KEY?
+check_setting() {
+	case "$1" in
+		schedule) case "$2" in off|daily|weekly) return 0 ;; esac ;;
+		weekday) in_range "$2" 0 6 && return 0 ;;
+		hour) in_range "$2" 0 23 && return 0 ;;
+		minute) in_range "$2" 0 59 && return 0 ;;
+		keep) in_range "$2" 1 100 && return 0 ;;
+		encrypt) case "$2" in 0|1) return 0 ;; esac ;;
+		drive)
+			[ -z "$2" ] && return 0
+			printf '%s' "$2" | grep -qE '^/(tmp/mountd|mnt)/[A-Za-z0-9._-]+$' && return 0
+			;;
+	esac
+	return 1
+}
+
+SETTINGS="schedule weekday hour minute keep drive encrypt"
+
+in_range() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	[ ${#1} -le 3 ] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+
+passphrase_set() {
+	[ -n "$(uci -q get autobackup_auth.main.passphrase)" ] && echo 1 || echo 0
+}
+
+cmd_config() {
+	local k first=1
+	printf '{'
+	for k in $SETTINGS; do
+		[ $first = 1 ] || printf ','
+		first=0
+		printf '%s:%s' "$(jstr "$k")" "$(jstr "$(cfg "$k")")"
+	done
+	printf ',"passphrase_set":%s}\n' "$(jbool "$(passphrase_set)")"
+}
+
+# Nothing is stored unless every value is valid.
+cmd_set() {
+	local kv k v enc=""
+	[ $# -gt 0 ] || { printf '{"ok":false,"reason":"nothing_to_set"}\n'; exit 1; }
+	for kv in "$@"; do
+		k=${kv%%=*}
+		v=${kv#*=}
+		case "$kv" in *=*) ;; *) k=$kv v="" ;; esac
+		case " $SETTINGS " in *" $k "*) ;; *)
+			printf '{"ok":false,"reason":"unknown_setting","field":%s}\n' "$(jstr "$k")"
+			exit 1 ;;
+		esac
+		if ! check_setting "$k" "$v"; then
+			printf '{"ok":false,"reason":"invalid_value","field":%s}\n' "$(jstr "$k")"
+			exit 1
+		fi
+		[ "$k" = encrypt ] && enc=$v
+	done
+	# Encryption needs a passphrase first (a backup must never quietly
+	# fall back to an unencrypted file).
+	if [ "$enc" = 1 ] && [ "$(passphrase_set)" = 0 ]; then
+		printf '{"ok":false,"reason":"no_passphrase","field":"encrypt"}\n'
+		exit 1
+	fi
+	uci -q get autobackup.main >/dev/null || uci set autobackup.main=autobackup
+	for kv in "$@"; do
+		k=${kv%%=*}
+		v=${kv#*=}
+		case "$kv" in *=*) ;; *) v="" ;; esac
+		uci set "autobackup.main.$k=$v"
+	done
+	uci commit autobackup
+	cron_sync
+	printf '{"ok":true}\n'
+}
+
+# ------------------------------------------------------------- schedule --
+
+cron_line() {
+	local s m h d
+	s=$(cfg schedule)
+	m=$(num "$(cfg minute)" 30)
+	h=$(num "$(cfg hour)" 3)
+	d=$(num "$(cfg weekday)" 0)
+	in_range "$m" 0 59 || m=30
+	in_range "$h" 0 23 || h=3
+	in_range "$d" 0 6 || d=0
+	case "$s" in
+		daily) echo "$m $h * * * /usr/bin/autobackup backup --scheduled >/dev/null 2>&1 $CRON_MARK" ;;
+		weekly) echo "$m $h * * $d /usr/bin/autobackup backup --scheduled >/dev/null 2>&1 $CRON_MARK" ;;
+	esac
+}
+
+# Replace our line in root's crontab (only ever the line with our mark),
+# and restart cron when it changed.
+cron_write() {
+	local want="$1" now new
+	mkdir -p "${CRONTAB%/*}"
+	now=$(grep -F "$CRON_MARK" "$CRONTAB" 2>/dev/null)
+	[ "$now" = "$want" ] && return 0
+	new="$CRONTAB.autobackup.$$"
+	{
+		[ -f "$CRONTAB" ] && grep -vF "$CRON_MARK" "$CRONTAB"
+		[ -n "$want" ] && echo "$want"
+	} > "$new"
+	chmod 600 "$new"
+	mv "$new" "$CRONTAB"
+	if [ -x /etc/init.d/cron ]; then
+		/etc/init.d/cron enable 2>/dev/null
+		/etc/init.d/cron restart >/dev/null 2>&1
+	fi
+	return 0
+}
+
+cron_sync() { cron_write "$(cron_line)"; }
+
+# When the schedule runs next (Unix time), or 0 when off. Local time, as
+# cron runs it.
+next_run() {
+	local s m h d now hh mm ss wd t ahead
+	s=$(cfg schedule)
+	case "$s" in daily|weekly) ;; *) echo 0; return ;; esac
+	m=$(num "$(cfg minute)" 30)
+	h=$(num "$(cfg hour)" 3)
+	d=$(num "$(cfg weekday)" 0)
+	now=$(date +%s)
+	# shellcheck disable=SC2046
+	set -- $(date +'%H %M %S %w')
+	hh=${1#0} mm=${2#0} ss=${3#0} wd=$4
+	t=$((now - ${hh:-0} * 3600 - ${mm:-0} * 60 - ${ss:-0} + h * 3600 + m * 60))
+	if [ "$s" = daily ]; then
+		[ $t -le "$now" ] && t=$((t + 86400))
+	else
+		ahead=$(( (d - wd + 7) % 7 ))
+		t=$((t + ahead * 86400))
+		[ $t -le "$now" ] && t=$((t + 7 * 86400))
+	fi
+	echo $t
+}
+
 # ----------------------------------------------------------------- backup --
 
 cmd_backup() {
@@ -307,14 +454,20 @@ write_record() {
 	} > "$1.part" && [ -s "$1.part" ] && mv "$1.part" "$1"
 }
 
-# Records in a folder, newest first: "time<TAB>path" lines.
+# Records in a folder, newest first: "key<TAB>path" lines, the key being
+# the time and two digits more: backups made within the same second are
+# told apart by their number (name-2, name-3).
 records_by_time() {
-	local r t
+	local r t n
 	for r in "$1"/*.json; do
 		[ -f "$r" ] || continue
 		t=$(jsonfilter -i "$r" -e '@.time' 2>/dev/null)
 		case "$t" in ''|*[!0-9]*) continue ;; esac
-		printf '%s\t%s\n' "$t" "$r"
+		n=${r%.json}
+		n=${n##*-}
+		case "$n" in ''|*[!0-9]*|???*) n=1 ;; esac
+		# One number to sort on (busybox sort ignores per-key flags).
+		printf '%s%02d\t%s\n' "$t" "$n" "$r"
 	done | sort -rn
 }
 
@@ -418,6 +571,9 @@ cmd_status() {
 	printf ',"router":{"hostname":%s,"model":%s,"model_name":%s,"board":%s,"firmware":%s}' \
 		"$(jstr "$(hostname_)")" "$(jstr "$(model)")" "$(jstr "$(model_name)")" "$(jstr "$(board)")" "$(jstr "$(firmware)")"
 	printf ',"tested":%s,"tested_on":%s' "$(jbool "$(is_tested)")" "$(jstr "$TESTED")"
+	printf ',"schedule":%s,"next_run":%s' "$(jstr "$(cfg schedule)")" "$(next_run)"
+	printf ',"keep":%s,"encrypt":%s,"passphrase_set":%s' "$(num "$(cfg keep)" 10)" \
+		"$(jbool "$(cfg encrypt)")" "$(jbool "$(passphrase_set)")"
 	printf '}\n'
 }
 
@@ -430,9 +586,13 @@ case "$cmd" in
 	list) cmd_list ;;
 	delete) cmd_delete "$1" ;;
 	status) cmd_status ;;
+	config) cmd_config ;;
+	set) cmd_set "$@" ;;
+	cron-sync) cron_sync ;;
+	cron-remove) cron_write "" ;;
 	version) echo "$VERSION" ;;
 	*)
-		echo "usage: autobackup backup|list|delete ID|status|version" >&2
+		echo "usage: autobackup backup|list|delete ID|status|config|set KEY=VALUE...|version" >&2
 		exit 2
 		;;
 esac

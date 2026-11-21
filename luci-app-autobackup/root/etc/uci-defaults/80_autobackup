@@ -9,4 +9,29 @@ chmod 600 /etc/config/autobackup_auth
 rm -f /etc/config/autobackup-opkg /etc/config/autobackup_auth-opkg
 mkdir -p /etc/autobackup
 chmod 700 /etc/autobackup
+
+# The rpcd plugin and the menu entry: visible without a reboot.
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+/etc/init.d/rpcd reload 2>/dev/null
+
+# reload_config only notices changes to configs it already has a checksum
+# for; register ours so the first "Save & Apply" applies the schedule.
+if [ -f /var/run/config.md5 ] && ! grep -q '/var/run/config.check/autobackup$' /var/run/config.md5; then
+	mkdir -p /var/run/config.check
+	uci show autobackup > /var/run/config.check/autobackup 2>/dev/null
+	md5sum /var/run/config.check/autobackup >> /var/run/config.md5
+	rm -rf /var/run/config.check
+fi
+
+# GL.iNet admin panel: its web server keeps a panel module in memory once
+# it has been used, so reload it (gracefully) to pick up a new version.
+if [ -d /usr/lib/oui-httpd/rpc ] && [ -s /var/run/nginx.pid ] && [ -x /usr/sbin/nginx ]; then
+	/usr/sbin/nginx -s reload 2>/dev/null
+fi
+
+/etc/init.d/autobackup enable 2>/dev/null
+# The schedule as the settings say (also after a restore brought back
+# settings with another schedule).
+/usr/bin/autobackup cron-sync 2>/dev/null
 exit 0

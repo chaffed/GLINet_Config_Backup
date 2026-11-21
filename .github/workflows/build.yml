@@ -18,6 +18,7 @@ jobs:
       - name: Lint shell scripts
         run: |
           shellcheck luci-app-autobackup/root/usr/bin/autobackup \
+            luci-app-autobackup/root/etc/init.d/autobackup \
             luci-app-autobackup/root/etc/uci-defaults/* \
             scripts/*.sh tests/*.sh
 

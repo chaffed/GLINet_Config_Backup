@@ -203,6 +203,62 @@ logread > /out/log.txt 2>/dev/null || true
     check(r.get("reason") == "drive_missing" and read(out, "status2").get("drive_reason") == "drive_missing",
           "chosen drive not plugged in: reason drive_missing")
 
+    # ------------------------------------------------------------ schedule
+    out = run(r"""
+mkdir -p /etc/crontabs
+echo '0 1 * * * /bin/someone-elses-job' > /etc/crontabs/root
+step=daily; o autobackup set schedule=daily hour=4 minute=5
+cp /etc/crontabs/root /out/cron_daily.txt
+step=st_daily; o autobackup status
+date +%s > /out/now.txt
+step=weekly; o autobackup set schedule=weekly weekday=2 hour=23 minute=59
+cp /etc/crontabs/root /out/cron_weekly.txt
+step=st_weekly; o autobackup status
+step=config; o autobackup config
+for bad in hour=24 minute=60 minute=5x schedule=hourly keep=0 keep=101 weekday=7 drive=/etc drive=/mnt/../etc 'drive=/mnt/a b' color=red encrypt=2; do
+	autobackup set "$bad" >> /out/bad.txt 2>&1
+done
+autobackup set keep=5 hour=99 >> /out/bad.txt 2>&1
+step=config2; o autobackup config
+step=enc; o autobackup set encrypt=1
+step=off; o autobackup set schedule=off
+cp /etc/crontabs/root /out/cron_off.txt
+step=st_off; o autobackup status
+autobackup set schedule=daily >/dev/null
+autobackup cron-remove
+cp /etc/crontabs/root /out/cron_removed.txt
+""", None, "schedule")
+    check(read(out, "daily").get("ok") is True, "set: a daily schedule is stored")
+    cron = read(out, "cron_daily", "txt").splitlines()
+    check(cron == ["0 1 * * * /bin/someone-elses-job",
+                   "5 4 * * * /usr/bin/autobackup backup --scheduled >/dev/null 2>&1 # autobackup"],
+          "cron: daily at 04:05, other jobs kept (%s)" % cron)
+    now = int(read(out, "now", "txt"))
+    nr = read(out, "st_daily").get("next_run", 0)
+    import time as _t
+    tm = _t.gmtime(nr)
+    check(now < nr <= now + 86400 and (tm.tm_hour, tm.tm_min, tm.tm_sec) == (4, 5, 0),
+          "status: next daily run is the next 04:05 (container time is UTC)")
+    cron = read(out, "cron_weekly", "txt").splitlines()
+    check(cron[-1].startswith("59 23 * * 2 /usr/bin/autobackup backup --scheduled") and len(cron) == 2,
+          "cron: weekly on Tuesday at 23:59 replaces the daily line")
+    nr = read(out, "st_weekly").get("next_run", 0)
+    tm = _t.gmtime(nr)
+    check(now < nr <= now + 7 * 86400 and (tm.tm_hour, tm.tm_min) == (23, 59) and (tm.tm_wday + 1) % 7 == 2,
+          "status: next weekly run is the next Tuesday 23:59")
+    cfgj = read(out, "config")
+    check(cfgj.get("schedule") == "weekly" and cfgj.get("weekday") == "2" and cfgj.get("keep") == "10"
+          and cfgj.get("passphrase_set") is False and "passphrase" not in cfgj, "config: the settings, never a passphrase")
+    bad = read(out, "bad", "txt").splitlines()
+    check(len(bad) == 13 and all('"ok":false' in b for b in bad), "set: refuses every invalid value and unknown setting")
+    check(read(out, "config2") == cfgj, "set: nothing is stored when one value is invalid")
+    enc = read(out, "enc")
+    check(enc.get("reason") == "no_passphrase", "set: encryption cannot be switched on before a passphrase is set")
+    check(read(out, "cron_off", "txt").splitlines() == ["0 1 * * * /bin/someone-elses-job"]
+          and read(out, "st_off").get("next_run") == 0, "schedule off: our line is gone, the other job stays")
+    check(read(out, "cron_removed", "txt").splitlines() == ["0 1 * * * /bin/someone-elses-job"],
+          "cron-remove (package removal): our line is gone, the other job stays")
+
     # ------------------------------------------------- delete, busy, names
     drive = os.path.join(work, "delete")
     os.makedirs(drive)
